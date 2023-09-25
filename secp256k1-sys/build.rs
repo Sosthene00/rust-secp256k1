@@ -24,6 +24,7 @@
 extern crate cc;
 
 use std::env;
+use std::process::Command;
 
 fn main() {
     // Actual build
@@ -58,11 +59,39 @@ fn main() {
                    .file("wasm/wasm.c");
     }
 
+    if env::var("CARGO_CFG_TARGET_ARCH").unwrap() == "arm" {
+        // base_config.define("DCMAKE_TOOLCHAIN_FILE", Some("${ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake"));
+        // base_config.define("DANDROID_ABI", Some("arm64-v8a"));
+        // base_config.define("DANDROID_PLATFORM", Some("28"));
+
+        // Build the C library using CMake
+        let status = Command::new("cmake")
+            .arg("..")
+            .arg("-DCMAKE_TOOLCHAIN_FILE=/home/sosthene/dev/opt/android-sdk/ndk/25.1.8937393/build/cmake/android.toolchain.cmake")
+            .arg("-DANDROID_ABI=armeabi-v7a") // Adjust for armv7
+            .arg("-DANDROID_PLATFORM=28")
+            .status()
+            .expect("Failed to run CMake");
+
+        assert!(status.success());
+
+        // Run make to compile the library
+        let status = Command::new("make")
+            .status()
+            .expect("Failed to run make");
+
+        assert!(status.success());
+
+        // Optionally, tell Cargo where to find the built library.
+        // Note: Adjust the path to where the built library resides.
+        // println!("cargo:rustc-link-search=native=path/to/built/library");
+    }
+
     // secp256k1
-    base_config.file("depend/secp256k1/contrib/lax_der_parsing.c")
-               .file("depend/secp256k1/src/precomputed_ecmult_gen.c")
-               .file("depend/secp256k1/src/precomputed_ecmult.c")
-               .file("depend/secp256k1/src/secp256k1.c")
-               .compile("libsecp256k1.a");
+    // base_config.file("depend/secp256k1/contrib/lax_der_parsing.c")
+    //            .file("depend/secp256k1/src/precomputed_ecmult_gen.c")
+    //            .file("depend/secp256k1/src/precomputed_ecmult.c")
+    //            .file("depend/secp256k1/src/secp256k1.c")
+    //            .compile("libsecp256k1.a");
 }
 
