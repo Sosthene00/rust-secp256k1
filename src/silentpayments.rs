@@ -382,6 +382,22 @@ impl SilentpaymentsFoundOutput {
     pub fn empty() -> SilentpaymentsFoundOutput {
         SilentpaymentsFoundOutput(ffi::SilentpaymentsFoundOutput::empty())
     }
+
+    pub fn get_output_key(&self) -> XOnlyPublicKey {
+        XOnlyPublicKey::from(self.0.output)
+    }
+
+    pub fn get_tweak(&self) -> [u8; 32] {
+        self.0.get_tweak()
+    }
+
+    pub fn get_label(&self) -> Option<PublicKey> {
+        if let Some(pubkey) = self.0.get_label() {
+            Some(PublicKey::from(pubkey))
+        } else {
+            None
+        }
+    }
 }
 
 /// Output scan errors

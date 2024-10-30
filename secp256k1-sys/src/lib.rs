@@ -1239,6 +1239,18 @@ impl SilentpaymentsFoundOutput {
             label: label.clone(),
         }
     }
+
+    pub fn get_tweak(&self) -> [u8; 32] {
+        self.tweak
+    }
+
+    pub fn get_label(&self) -> Option<PublicKey> {
+        if self.found_with_label {
+            Some(self.label)
+        } else {
+            None
+        }
+    }
 }
 
 #[cfg(not(secp256k1_fuzz))]
