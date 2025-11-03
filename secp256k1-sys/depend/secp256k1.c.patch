@@ -1,4 +1,4 @@
-140,150d139
+141,150d140
 < secp256k1_context* secp256k1_context_create(unsigned int flags) {
 <     size_t const prealloc_size = secp256k1_context_preallocated_size(flags);
 <     secp256k1_context* ctx = (secp256k1_context*)checked_malloc(&default_error_callback, prealloc_size);
@@ -9,8 +9,7 @@
 < 
 <     return ctx;
 < }
-< 
-162,174d150
+163,174d152
 < secp256k1_context* secp256k1_context_clone(const secp256k1_context* ctx) {
 <     secp256k1_context* ret;
 <     size_t prealloc_size;
@@ -23,8 +22,7 @@
 <     ret = secp256k1_context_preallocated_clone(ctx, ret);
 <     return ret;
 < }
-< 
-186,197d161
+187,197d164
 < void secp256k1_context_destroy(secp256k1_context* ctx) {
 <     ARG_CHECK_VOID(ctx == NULL || secp256k1_context_is_proper(ctx));
 < 
@@ -36,15 +34,13 @@
 <     secp256k1_context_preallocated_destroy(ctx);
 <     free(ctx);
 < }
-< 
-220,229d183
-< }
-< 
-< secp256k1_scratch_space* secp256k1_scratch_space_create(const secp256k1_context* ctx, size_t max_size) {
+223,231d189
+< static secp256k1_scratch_space* secp256k1_scratch_space_create(const secp256k1_context* ctx, size_t max_size) {
 <     VERIFY_CHECK(ctx != NULL);
 <     return secp256k1_scratch_create(&ctx->error_callback, max_size);
 < }
 < 
-< void secp256k1_scratch_space_destroy(const secp256k1_context *ctx, secp256k1_scratch_space* scratch) {
+< static void secp256k1_scratch_space_destroy(const secp256k1_context *ctx, secp256k1_scratch_space* scratch) {
 <     VERIFY_CHECK(ctx != NULL);
 <     secp256k1_scratch_destroy(&ctx->error_callback, scratch);
+< }

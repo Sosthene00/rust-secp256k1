@@ -1,4 +1,4 @@
-13,37d12
+13,36d12
 < static secp256k1_scratch* secp256k1_scratch_create(const secp256k1_callback* error_callback, size_t size) {
 <     const size_t base_alloc = ROUND_TO_ALIGN(sizeof(secp256k1_scratch));
 <     void *alloc = checked_malloc(error_callback, base_alloc + size);
@@ -23,4 +23,3 @@
 <         free(scratch);
 <     }
 < }
-< 
