@@ -29,13 +29,6 @@
 #define SECP256K1_N_H_2 ((uint64_t)0xFFFFFFFFFFFFFFFFULL)
 #define SECP256K1_N_H_3 ((uint64_t)0x7FFFFFFFFFFFFFFFULL)
 
-SECP256K1_INLINE static void rustsecp256k1_v0_10_0_scalar_clear(rustsecp256k1_v0_10_0_scalar *r) {
-    r->d[0] = 0;
-    r->d[1] = 0;
-    r->d[2] = 0;
-    r->d[3] = 0;
-}
-
 SECP256K1_INLINE static void rustsecp256k1_v0_10_0_scalar_set_int(rustsecp256k1_v0_10_0_scalar *r, unsigned int v) {
     r->d[0] = v;
     r->d[1] = 0;

@@ -213,7 +213,7 @@ static void rustsecp256k1_v0_10_0_ecmult_gen(const rustsecp256k1_v0_10_0_ecmult_
                  * but this would simply discard the bits that fall off at the bottom,
                  * and thus, for example, bitdata could still have only two values if we
                  * happen to shift by exactly 31 positions. We use a rotation instead,
-                 * which ensures that bitdata doesn't loose entropy. This relies on the
+                 * which ensures that bitdata doesn't lose entropy. This relies on the
                  * rotation being atomic, i.e., the compiler emitting an actual rot
                  * instruction. */
                 uint32_t bitdata = rustsecp256k1_v0_10_0_rotr32(recoded[bit_pos >> 5], bit_pos & 0x1f);
@@ -242,7 +242,7 @@ static void rustsecp256k1_v0_10_0_ecmult_gen(const rustsecp256k1_v0_10_0_ecmult_
              *    (https://cryptojedi.org/peter/data/chesrump-20130822.pdf) and
              *   "Cache Attacks and Countermeasures: the Case of AES", RSA 2006,
              *    by Dag Arne Osvik, Adi Shamir, and Eran Tromer
-             *    (https://www.tau.ac.il/~tromer/papers/cache.pdf)
+             *    (https://eprint.iacr.org/2005/271.pdf)
              */
             for (index = 0; index < COMB_POINTS; ++index) {
                 rustsecp256k1_v0_10_0_ge_storage_cmov(&adds, &rustsecp256k1_v0_10_0_ecmult_gen_prec_table[block][index], index == abs);
@@ -277,8 +277,8 @@ static void rustsecp256k1_v0_10_0_ecmult_gen(const rustsecp256k1_v0_10_0_ecmult_
     /* Cleanup. */
     rustsecp256k1_v0_10_0_fe_clear(&neg);
     rustsecp256k1_v0_10_0_ge_clear(&add);
-    memset(&adds, 0, sizeof(adds));
-    memset(&recoded, 0, sizeof(recoded));
+    rustsecp256k1_v0_10_0_memclear_explicit(&adds, sizeof(adds));
+    rustsecp256k1_v0_10_0_memclear_explicit(&recoded, sizeof(recoded));
 }
 
 /* Setup blinding values for rustsecp256k1_v0_10_0_ecmult_gen. */
@@ -310,7 +310,7 @@ static void rustsecp256k1_v0_10_0_ecmult_gen_blind(rustsecp256k1_v0_10_0_ecmult_
     VERIFY_CHECK(seed32 != NULL);
     memcpy(keydata + 32, seed32, 32);
     rustsecp256k1_v0_10_0_rfc6979_hmac_sha256_initialize(&rng, keydata, 64);
-    memset(keydata, 0, sizeof(keydata));
+    rustsecp256k1_v0_10_0_memclear_explicit(keydata, sizeof(keydata));
 
     /* Compute projective blinding factor (cannot be 0). */
     rustsecp256k1_v0_10_0_rfc6979_hmac_sha256_generate(&rng, nonce32, 32);
@@ -325,16 +325,17 @@ static void rustsecp256k1_v0_10_0_ecmult_gen_blind(rustsecp256k1_v0_10_0_ecmult_
      * which rustsecp256k1_v0_10_0_gej_add_ge cannot handle. */
     rustsecp256k1_v0_10_0_scalar_cmov(&b, &rustsecp256k1_v0_10_0_scalar_one, rustsecp256k1_v0_10_0_scalar_is_zero(&b));
     rustsecp256k1_v0_10_0_rfc6979_hmac_sha256_finalize(&rng);
-    memset(nonce32, 0, 32);
     rustsecp256k1_v0_10_0_ecmult_gen(ctx, &gb, &b);
     rustsecp256k1_v0_10_0_scalar_negate(&b, &b);
     rustsecp256k1_v0_10_0_scalar_add(&ctx->scalar_offset, &b, &diff);
     rustsecp256k1_v0_10_0_ge_set_gej(&ctx->ge_offset, &gb);
 
     /* Clean up. */
+    rustsecp256k1_v0_10_0_memclear_explicit(nonce32, sizeof(nonce32));
     rustsecp256k1_v0_10_0_scalar_clear(&b);
     rustsecp256k1_v0_10_0_gej_clear(&gb);
     rustsecp256k1_v0_10_0_fe_clear(&f);
+    rustsecp256k1_v0_10_0_rfc6979_hmac_sha256_clear(&rng);
 }
 
 #endif /* SECP256K1_ECMULT_GEN_IMPL_H */

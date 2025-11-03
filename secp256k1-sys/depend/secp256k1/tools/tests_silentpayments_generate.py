@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
+
+"""
+A script to convert BIP352 test vectors from JSON to a C header.
+
+Usage:
+
+    ./tools/tests_silentpayments_generate.py src/modules/silentpayments/bip352_send_and_receive_test_vectors.json  > ./src/modules/silentpayments/vectors.h
+"""
+
 import hashlib
 import json
 import sys
-
-import bech32m
-import ripemd160
 
 NUMS_H = bytes.fromhex("50929b74c1a04954b78b4b6035e97a5e078a5a0f28ec96d547bfee9ace803ac0")
 MAX_INPUTS_PER_TEST_CASE = 3
@@ -14,61 +20,33 @@ MAX_PERMUTATIONS_PER_SENDING_TEST_CASE = 12
 def sha256(s):
     return hashlib.sha256(s).digest()
 
-def hash160(s):
-    return ripemd160.ripemd160(sha256(s))
-
 def smallest_outpoint(outpoints):
     serialized_outpoints = [bytes.fromhex(txid)[::-1] + n.to_bytes(4, 'little') for txid, n in outpoints]
     return sorted(serialized_outpoints)[0]
 
-def decode_silent_payments_address(address):
-    _, data = bech32m.decode("sp", address)
-    data = bytes(data)  # convert from list to bytes
-    assert len(data) == 66
-    return data[:33], data[33:]
-
 def is_p2tr(s):  # OP_1 OP_PUSHBYTES_32 <32 bytes>
     return (len(s) == 34) and (s[0] == 0x51) and (s[1] == 0x20)
 
-def is_p2wpkh(s):  # OP_0 OP_PUSHBYTES_20 <20 bytes>
-    return (len(s) == 22) and (s[0] == 0x00) and (s[1] == 0x14)
+def get_pubkey_from_input(input_data, pubkey_hex):
+    """Extract the correct pubkey for an input, handling NUMS_H filtering and format conversion"""
+    spk = bytes.fromhex(input_data['prevout']['scriptPubKey']['hex'])
+    pubkey = bytes.fromhex(pubkey_hex)
 
-def is_p2sh(s):  # OP_HASH160 OP_PUSHBYTES_20 <20 bytes> OP_EQUAL
-    return (len(s) == 23) and (s[0] == 0xA9) and (s[1] == 0x14) and (s[-1] == 0x87)
+    if is_p2tr(spk):  # taproot input
+        # Check for NUMS_H in witness (should be skipped)
+        witness = bytes.fromhex(input_data.get('txinwitness', ''))
+        # Parse witness stack
+        witness_stack = []
+        num_witness_items = 0
+        if len(witness) > 0:
+            num_witness_items = witness[0]
+            witness = witness[1:]
+        for i in range(num_witness_items):
+            item_len = witness[0]
+            witness_stack.append(witness[1:item_len+1])
+            witness = witness[item_len+1:]
 
-def is_p2pkh(s):  # OP_DUP OP_HASH160 OP_PUSHBYTES_20 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
-    return (len(s) == 25) and (s[0] == 0x76) and (s[1] == 0xA9) and (s[2] == 0x14) and \
-        (s[-2] == 0x88) and (s[-1] == 0xAC)
-
-def get_pubkey_from_input(spk, script_sig, witness):
-    # build witness stack from raw witness data
-    witness_stack = []
-    no_witness_items = 0
-    if len(witness) > 0:
-        no_witness_items = witness[0]
-        witness = witness[1:]
-    for i in range(no_witness_items):
-        item_len = witness[0]
-        witness_stack.append(witness[1:item_len+1])
-        witness = witness[item_len+1:]
-
-    if is_p2pkh(spk):
-        spk_pkh = spk[3:3 + 20]
-        for i in range(len(script_sig), 0, -1):
-            if i - 33 >= 0:
-                pk = script_sig[i - 33:i]
-                if hash160(pk) == spk_pkh:
-                    return pk
-    elif is_p2sh(spk) and is_p2wpkh(script_sig[1:]):
-        pubkey = witness_stack[-1]
-        if len(pubkey) == 33:
-            return pubkey
-    elif is_p2wpkh(spk):
-        # the witness must contain two items and the second item is the pubkey
-        pubkey = witness_stack[-1]
-        if len(pubkey) == 33:
-            return pubkey
-    elif is_p2tr(spk):
+        # Check for script-path spend with NUMS_H
         if len(witness_stack) > 1 and witness_stack[-1][0] == 0x50:
             witness_stack.pop()
         if len(witness_stack) > 1:  # script-path spend?
@@ -76,171 +54,104 @@ def get_pubkey_from_input(spk, script_sig, witness):
             internal_key = control_block[1:33]
             if internal_key == NUMS_H:  # skip
                 return b''
-        return spk[2:]
 
-    return b''
+        # Convert to x-only (32 bytes) for taproot
+        if len(pubkey) == 33:
+            pubkey = pubkey[1:]  # Remove prefix byte
+        return pubkey
+    else:  # regular input - use full compressed pubkey (33 bytes)
+        return pubkey
 
-def to_c_array(x):
-    if x == "":
+def gen_byte_array(hex):
+    assert len(hex) % 2 == 0
+    if hex == "":
+        return "{0x00}"
+    s = ',0x'.join(a + b for a, b in zip(hex[::2], hex[1::2]))
+    return "{0x" + s + "}"
+
+def maybe_gen_comment(comment):
+    if comment:
+        return f" /* {comment} */"
+    else:
         return ""
-    s = ',0x'.join(a+b for a,b in zip(x[::2], x[1::2]))
-    return "0x" + s
 
-def emit_key_material(comment, keys, include_count=False):
-    global out
-    if include_count:
-        out += f"        {len(keys)}," + "\n"
-    out += f"        {{ /* {comment} */" + "\n"
-    for i in range(MAX_INPUTS_PER_TEST_CASE):
-        out += "            "
-        if i < len(keys):
-            out += "{"
-            out += to_c_array(keys[i])
-            out += "}"
-        else:
-            out += '""'
-        out += ",\n"
+def gen_key_material(keys, comment=None, prepend_count=False):
+    assert len(keys) <= MAX_INPUTS_PER_TEST_CASE
+    out = ""
+    if prepend_count:
+        out += f"        {len(keys)},\n"
+    out += f"        {{{maybe_gen_comment(comment)}\n"
+    for k in keys:
+        out += f"            {gen_byte_array(k)},\n"
+    if not keys:
+        out += '            "",\n'
     out +=  "        },\n"
+    return out
 
-def emit_recipient_addr_material(recipient_addresses):
-    global out
-    out += f"        {len(recipient_addresses)}," + "\n"
-    out +=  "        { /* recipient pubkeys (address data) */\n"
+def gen_recipient_addr_material(recipients):
+    assert len(recipients) <= MAX_OUTPUTS_PER_TEST_CASE
+    out = f"        {len(recipients)},\n"
+    out += "        { /* recipient pubkeys (address data) */\n"
     for i in range(MAX_OUTPUTS_PER_TEST_CASE):
         out += "            {\n"
-        if i < len(recipient_addresses):
-            B_scan, B_spend = decode_silent_payments_address(recipient_addresses[i])
-            out += "                {"
-            out += to_c_array(B_scan.hex())
-            out += "},\n"
-            out += "                {"
-            out += to_c_array(B_spend.hex())
-            out += "},\n"
+        if i < len(recipients):
+            # Use the scan_pubkey and spend_pubkey directly from the recipient
+            scan_pubkey = bytes.fromhex(recipients[i]['scan_pub_key'])
+            spend_pubkey = bytes.fromhex(recipients[i]['spend_pub_key'])
+
+            out += f"                {gen_byte_array(scan_pubkey.hex())},\n"
+            out += f"                {gen_byte_array(spend_pubkey.hex())},\n"
         else:
             out += '                "",\n'
             out += '                "",\n'
-        out += "            }"
-        out += ",\n"
+        out += "            },\n"
     out += "        },\n"
+    return out
 
-def emit_sending_outputs(comment, output_sets, include_count=False):
-    global out
-    if include_count:
-        out += f"        {len(output_sets)}," + "\n"
-        out += f"        {len(output_sets[0])}," + "\n"
-    if comment:
-        out += f"        {{ /* {comment} */" + "\n"
-    else:
-        out += "         {\n"
-    for i in range(MAX_PERMUTATIONS_PER_SENDING_TEST_CASE):
-        if i < len(output_sets):
-            emit_outputs(comment=None, outputs=output_sets[i], include_count=False, spacing=12)
-        else:
-            emit_outputs(comment=None, outputs=[], include_count=False, spacing=12)
-    out += "        }"
-    out += ","
-    out += "\n"
+def gen_sending_outputs(output_sets, comment=None, prepend_count=False):
+    assert len(output_sets) <= MAX_PERMUTATIONS_PER_SENDING_TEST_CASE
+    out = ""
+    if prepend_count:
+        out += f"        {len(output_sets)},\n"
+        out += f"        {len(output_sets[0])},\n"
+    out += f"        {{{maybe_gen_comment(comment)}\n"
+    for o in output_sets:
+        out += gen_outputs(outputs=o, prepend_count=False, indent=12)
+    if not output_sets:
+        out += gen_outputs(comment=None, outputs=[], prepend_count=False, indent=12)
+    out += "        },\n"
+    return out
 
-def emit_outputs(comment, outputs, include_count=False, last=False, spacing=8):
-    global out
-    if include_count:
-        out += spacing*" " + f"{len(outputs)}," + "\n"
-    if comment:
-        out += spacing*" " + f"{{ /* {comment} */" + "\n"
-    else:
-        out += spacing*" " + "{\n"
+def gen_outputs(outputs, comment=None, prepend_count=False, indent=8):
+    out = ""
+    spaces = indent * " "
+    if prepend_count:
+        out += spaces + f"{len(outputs)},\n"
+    out += f"        {{{maybe_gen_comment(comment)}\n"
+    for o in outputs:
+        out += spaces + f"    {gen_byte_array(o)},\n"
+    if not outputs:
+        out += spaces + '    "",\n'
+    out += spaces + "},\n"
+    return out
+
+def gen_labels(labels):
+    assert len(labels) <= MAX_OUTPUTS_PER_TEST_CASE
+    out = "        /* labels */\n"
+    out += f"        {len(labels)}, {{"
     for i in range(MAX_OUTPUTS_PER_TEST_CASE):
-        if i < len(outputs):
-            out += spacing*" " + "    {"
-            out += to_c_array(outputs[i])
-            out += "}"
-        else:
-            out += spacing*' ' + '    ""'
-        out += ",\n"
-    out += spacing*" " + "}"
-    if not last:
-        out += ","
-    out += "\n"
-
-filename_input = sys.argv[1]
-with open(filename_input) as f:
-    test_vectors = json.load(f)
-
-out = ""
-num_vectors = 0
-
-for test_nr, test_vector in enumerate(test_vectors):
-    # determine input private and public keys, grouped into plain and taproot/x-only
-    input_plain_seckeys = []
-    input_taproot_seckeys = []
-    input_plain_pubkeys = []
-    input_xonly_pubkeys = []
-    outpoints = []
-    for i in test_vector['sending'][0]['given']['vin']:
-        pub_key = get_pubkey_from_input(bytes.fromhex(i['prevout']['scriptPubKey']['hex']),
-            bytes.fromhex(i['scriptSig']), bytes.fromhex(i['txinwitness']))
-        if len(pub_key) == 33:  # regular input
-            input_plain_seckeys.append(i['private_key'])
-            input_plain_pubkeys.append(pub_key.hex())
-        elif len(pub_key) == 32:  # taproot input
-            input_taproot_seckeys.append(i['private_key'])
-            input_xonly_pubkeys.append(pub_key.hex())
-        outpoints.append((i['txid'], i['vout']))
-    if len(input_plain_pubkeys) == 0 and len(input_xonly_pubkeys) == 0:
-        continue
-
-    num_vectors += 1
-    out += f"    /* ----- {test_vector['comment']} ({num_vectors}) ----- */\n"
-    out +=  "    {\n"
-
-    outpoint_L = smallest_outpoint(outpoints).hex()
-    emit_key_material("input plain seckeys", input_plain_seckeys, include_count=True)
-    emit_key_material("input plain pubkeys", input_plain_pubkeys)
-    emit_key_material("input taproot seckeys", input_taproot_seckeys, include_count=True)
-    emit_key_material("input x-only pubkeys", input_xonly_pubkeys)
-    out += "        /* smallest outpoint */\n"
-    out += "        {"
-    out += to_c_array(outpoint_L)
-    out += "},\n"
-
-    # emit recipient pubkeys (address data)
-    emit_recipient_addr_material(test_vector['sending'][0]['given']['recipients'])
-    # emit recipient outputs
-    emit_sending_outputs("recipient outputs", test_vector['sending'][0]['expected']['outputs'], include_count=True)
-
-    # emit recipient scan/spend seckeys
-    recv_test_given = test_vector['receiving'][0]['given']
-    recv_test_expected = test_vector['receiving'][0]['expected']
-    out += "        /* recipient data (scan and spend seckeys) */\n"
-    out += "        {" + f"{to_c_array(recv_test_given['key_material']['scan_priv_key'])}" + "},\n"
-    out += "        {" + f"{to_c_array(recv_test_given['key_material']['spend_priv_key'])}" + "},\n"
-
-    # emit recipient to-scan outputs, labels and expected-found outputs
-    emit_outputs("outputs to scan", recv_test_given['outputs'], include_count=True)
-    labels = recv_test_given['labels']
-    out += f"        {len(labels)}, " + "{"
-    for i in range(4):
         if i < len(labels):
-            out += f"{labels[i]}"
+            out += f"{labels[i]}, "
         else:
-            out += "0xffffffff"
-        if i != 3:
-            out += ", "
-    out += "}, /* labels */\n"
-    expected_pubkeys = [o['pub_key'] for o in recv_test_expected['outputs']]
-    expected_tweaks = [o['priv_key_tweak'] for o in recv_test_expected['outputs']]
-    expected_signatures = [o['signature'] for o in recv_test_expected['outputs']]
-    out += "        /* expected output data (pubkeys and seckey tweaks) */\n"
-    emit_outputs("", expected_pubkeys, include_count=True)
-    emit_outputs("", expected_tweaks)
-    emit_outputs("", expected_signatures, last=True)
+            out += "0xffffffff, "
+    out += "},\n"
+    return out
 
-    out += "    }"
-    if test_nr != len(test_vectors)-1:
-        out += ","
-    out += "\n\n"
+def gen_preamble(test_vectors):
+    out = "/* Note: this file was autogenerated using tests_silentpayments_generate.py. Do not edit. */\n"
+    out += f"""
+#include <stddef.h>
 
-STRUCT_DEFINITIONS = f"""
 #define MAX_INPUTS_PER_TEST_CASE  {MAX_INPUTS_PER_TEST_CASE}
 #define MAX_OUTPUTS_PER_TEST_CASE {MAX_OUTPUTS_PER_TEST_CASE}
 #define MAX_PERMUTATIONS_PER_SENDING_TEST_CASE {MAX_PERMUTATIONS_PER_SENDING_TEST_CASE}
@@ -255,11 +166,9 @@ struct bip352_test_vector {{
     size_t num_plain_inputs;
     unsigned char plain_seckeys[MAX_INPUTS_PER_TEST_CASE][32];
     unsigned char plain_pubkeys[MAX_INPUTS_PER_TEST_CASE][33];
-
     size_t num_taproot_inputs;
     unsigned char taproot_seckeys[MAX_INPUTS_PER_TEST_CASE][32];
     unsigned char xonly_pubkeys[MAX_INPUTS_PER_TEST_CASE][32];
-
     unsigned char outpoint_smallest[36];
 
     /* Given sender data (pubkeys encoded per output address to send to) */
@@ -286,12 +195,85 @@ struct bip352_test_vector {{
     unsigned char found_signatures[MAX_OUTPUTS_PER_TEST_CASE][64];
 }};
 """
+    return out
 
-print("/* Note: this file was autogenerated using tests_silentpayments_generate.py. Do not edit. */")
-print(f"#define SECP256K1_SILENTPAYMENTS_NUMBER_TESTVECTORS ({num_vectors})")
+def gen_test_vectors(test_vectors):
+    out = f"#define SECP256K1_SILENTPAYMENTS_NUMBER_TESTVECTORS {len(test_vectors)}\n\n"
+    out += "static const struct bip352_test_vector bip352_test_vectors[SECP256K1_SILENTPAYMENTS_NUMBER_TESTVECTORS] = {\n"
+    for test_i, test_vector in enumerate(test_vectors):
+        # determine input private and public keys, grouped into plain and taproot/x-only
+        input_plain_seckeys = []
+        input_taproot_seckeys = []
+        input_plain_pubkeys = []
+        input_xonly_pubkeys = []
+        outpoints = []
 
-print(STRUCT_DEFINITIONS)
+        pubkey_index = 0
+        input_pubkeys_hex = test_vector['sending'][0]['expected']['input_pub_keys']
 
-print("static const struct bip352_test_vector bip352_test_vectors[SECP256K1_SILENTPAYMENTS_NUMBER_TESTVECTORS] = {")
-print(out, end='')
-print("};")
+        for vec in test_vector['sending'][0]['given']['vin']:
+            outpoints.append((vec['txid'], vec['vout']))
+
+            if pubkey_index < len(input_pubkeys_hex):
+                pubkey = get_pubkey_from_input(vec, input_pubkeys_hex[pubkey_index])
+                if len(pubkey) == 33:  # regular input
+                    input_plain_seckeys.append(vec['private_key'])
+                    input_plain_pubkeys.append(pubkey.hex())
+                    pubkey_index += 1
+                elif len(pubkey) == 32:  # taproot input
+                    input_taproot_seckeys.append(vec['private_key'])
+                    input_xonly_pubkeys.append(pubkey.hex())
+                    pubkey_index += 1
+                # len(pubkey) == 0, it's a NUMS_H input - skip without incrementing
+
+        out += f"    /* ----- {test_vector['comment']} ({test_i + 1}) ----- */\n"
+        out +=  "    {\n"
+
+        outpoint_L = smallest_outpoint(outpoints).hex()
+        out += gen_key_material(input_plain_seckeys, "input plain seckeys", prepend_count=True)
+        out += gen_key_material(input_plain_pubkeys, "input plain pubkeys")
+        out += gen_key_material(input_taproot_seckeys, "input taproot seckeys", prepend_count=True)
+        out += gen_key_material(input_xonly_pubkeys, "input x-only pubkeys")
+        out += "        /* smallest outpoint */\n"
+        out += f"        {gen_byte_array(outpoint_L)},\n"
+
+        # emit recipient pubkeys (address data)
+        out += gen_recipient_addr_material(test_vector['sending'][0]['given']['recipients'])
+        # emit recipient outputs
+        out += gen_sending_outputs(test_vector['sending'][0]['expected']['outputs'], "recipient outputs", prepend_count=True)
+
+        # emit recipient scan/spend seckeys
+        recv_test_given = test_vector['receiving'][0]['given']
+        recv_test_expected = test_vector['receiving'][0]['expected']
+        out += "        /* recipient data (scan and spend seckeys) */\n"
+        out += f"        {gen_byte_array(recv_test_given['key_material']['scan_priv_key'])},\n"
+        out += f"        {gen_byte_array(recv_test_given['key_material']['spend_priv_key'])},\n"
+
+        # emit recipient to-scan outputs, labels and expected-found outputs
+        out += gen_outputs(recv_test_given['outputs'], "outputs to scan", prepend_count=True)
+        out += gen_labels(recv_test_given['labels'])
+        expected_pubkeys = [o['pub_key'] for o in recv_test_expected['outputs']]
+        expected_tweaks = [o['priv_key_tweak'] for o in recv_test_expected['outputs']]
+        expected_signatures = [o['signature'] for o in recv_test_expected['outputs']]
+        out += "        /* expected output data (pubkeys and seckey tweaks) */\n"
+        out += gen_outputs(expected_pubkeys, prepend_count=True)
+        out += gen_outputs(expected_tweaks)
+        out += gen_outputs(expected_signatures)
+        out += "    },\n\n"
+    out += "};\n"
+    return out
+
+def main():
+    if len(sys.argv) != 2:
+        print(__doc__)
+        sys.exit(1)
+
+    filename_input = sys.argv[1]
+    with open(filename_input) as f:
+        test_vectors = json.load(f)
+
+    print(gen_preamble(test_vectors))
+    print(gen_test_vectors(test_vectors), end="")
+
+if __name__ == "__main__":
+    main()

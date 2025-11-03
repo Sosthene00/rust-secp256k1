@@ -19,7 +19,7 @@ extern "C" {
  *  use rustsecp256k1_v0_10_0_xonly_pubkey_serialize and rustsecp256k1_v0_10_0_xonly_pubkey_parse. To
  *  compare keys, use rustsecp256k1_v0_10_0_xonly_pubkey_cmp.
  */
-typedef struct {
+typedef struct rustsecp256k1_v0_10_0_xonly_pubkey {
     unsigned char data[64];
 } rustsecp256k1_v0_10_0_xonly_pubkey;
 
@@ -30,7 +30,7 @@ typedef struct {
  *  guaranteed to be portable between different platforms or versions. It is
  *  however guaranteed to be 96 bytes in size, and can be safely copied/moved.
  */
-typedef struct {
+typedef struct rustsecp256k1_v0_10_0_keypair {
     unsigned char data[96];
 } rustsecp256k1_v0_10_0_keypair;
 
@@ -90,7 +90,7 @@ SECP256K1_API int rustsecp256k1_v0_10_0_xonly_pubkey_cmp(
  *                     the negation of the pubkey and set to 0 otherwise.
  *  In:        pubkey: pointer to a public key that is converted.
  */
-SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int rustsecp256k1_v0_10_0_xonly_pubkey_from_pubkey(
+SECP256K1_API int rustsecp256k1_v0_10_0_xonly_pubkey_from_pubkey(
     const rustsecp256k1_v0_10_0_context *ctx,
     rustsecp256k1_v0_10_0_xonly_pubkey *xonly_pubkey,
     int *pk_parity,
@@ -155,10 +155,13 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int rustsecp256k1_v0_10_0_xonly_pubke
     const unsigned char *tweak32
 ) SECP256K1_ARG_NONNULL(1) SECP256K1_ARG_NONNULL(2) SECP256K1_ARG_NONNULL(4) SECP256K1_ARG_NONNULL(5);
 
-/** Compute the keypair for a secret key.
+/** Compute the keypair for a valid secret key.
  *
- *  Returns: 1: secret was valid, keypair is ready to use
- *           0: secret was invalid, try again with a different secret
+ *  See the documentation of `rustsecp256k1_v0_10_0_ec_seckey_verify` for more information
+ *  about the validity of secret keys.
+ *
+ *  Returns: 1: secret key is valid
+ *           0: secret key is invalid
  *  Args:    ctx: pointer to a context object (not rustsecp256k1_v0_10_0_context_static).
  *  Out: keypair: pointer to the created keypair.
  *  In:   seckey: pointer to a 32-byte secret key.
@@ -176,7 +179,7 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int rustsecp256k1_v0_10_0_keypair_cre
  *  Out: seckey: pointer to a 32-byte buffer for the secret key.
  *  In: keypair: pointer to a keypair.
  */
-SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int rustsecp256k1_v0_10_0_keypair_sec(
+SECP256K1_API int rustsecp256k1_v0_10_0_keypair_sec(
     const rustsecp256k1_v0_10_0_context *ctx,
     unsigned char *seckey,
     const rustsecp256k1_v0_10_0_keypair *keypair
@@ -189,7 +192,7 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int rustsecp256k1_v0_10_0_keypair_sec
  *  Out: pubkey: pointer to a pubkey object, set to the keypair public key.
  *  In: keypair: pointer to a keypair.
  */
-SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int rustsecp256k1_v0_10_0_keypair_pub(
+SECP256K1_API int rustsecp256k1_v0_10_0_keypair_pub(
     const rustsecp256k1_v0_10_0_context *ctx,
     rustsecp256k1_v0_10_0_pubkey *pubkey,
     const rustsecp256k1_v0_10_0_keypair *keypair
@@ -208,7 +211,7 @@ SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int rustsecp256k1_v0_10_0_keypair_pub
  *               pk_parity argument of rustsecp256k1_v0_10_0_xonly_pubkey_from_pubkey.
  *  In: keypair: pointer to a keypair.
  */
-SECP256K1_API SECP256K1_WARN_UNUSED_RESULT int rustsecp256k1_v0_10_0_keypair_xonly_pub(
+SECP256K1_API int rustsecp256k1_v0_10_0_keypair_xonly_pub(
     const rustsecp256k1_v0_10_0_context *ctx,
     rustsecp256k1_v0_10_0_xonly_pubkey *pubkey,
     int *pk_parity,

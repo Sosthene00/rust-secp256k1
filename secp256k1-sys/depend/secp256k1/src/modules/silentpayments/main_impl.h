@@ -10,8 +10,23 @@
 #include "../../../include/secp256k1_extrakeys.h"
 #include "../../../include/secp256k1_silentpayments.h"
 
+#include "../../eckey.h"
+#include "../../ecmult.h"
+#include "../../ecmult_const.h"
+#include "../../ecmult_gen.h"
+#include "../../group.h"
+#include "../../hash.h"
+#include "../../hsort.h"
+
+/** magic bytes for ensuring prevouts_summary objects were initialized correctly. */
+static const unsigned char rustsecp256k1_v0_10_0_silentpayments_prevouts_summary_magic[4] = { 0xa7, 0x1c, 0xd3, 0x5e };
+
 /** Sort an array of silent payment recipients. This is used to group recipients by scan pubkey to
- *  ensure the correct values of k are used when creating multiple outputs for a recipient. */
+ *  ensure the correct values of k are used when creating multiple outputs for a recipient.
+ *
+ *  Note: rustsecp256k1_v0_10_0_ec_pubkey_cmp uses heap sort, which is unstable. Developers cannot and should not
+ *  rely on deterministic sorting of _recipient objects.
+ */
 static int rustsecp256k1_v0_10_0_silentpayments_recipient_sort_cmp(const void* pk1, const void* pk2, void *ctx) {
     return rustsecp256k1_v0_10_0_ec_pubkey_cmp((rustsecp256k1_v0_10_0_context *)ctx,
         &(*(const rustsecp256k1_v0_10_0_silentpayments_recipient **)pk1)->scan_pubkey,
@@ -20,7 +35,6 @@ static int rustsecp256k1_v0_10_0_silentpayments_recipient_sort_cmp(const void* p
 }
 
 static void rustsecp256k1_v0_10_0_silentpayments_recipient_sort(const rustsecp256k1_v0_10_0_context* ctx, const rustsecp256k1_v0_10_0_silentpayments_recipient **recipients, size_t n_recipients) {
-
     /* Suppress wrong warning (fixed in MSVC 19.33) */
     #if defined(_MSC_VER) && (_MSC_VER < 1933)
     #pragma warning(push)
@@ -49,42 +63,56 @@ static void rustsecp256k1_v0_10_0_silentpayments_sha256_init_inputs(rustsecp256k
     hash->bytes = 64;
 }
 
-static void rustsecp256k1_v0_10_0_silentpayments_calculate_input_hash(unsigned char *input_hash, const unsigned char *outpoint_smallest36, rustsecp256k1_v0_10_0_ge *pubkey_sum) {
+/** Callers must ensure that pubkey_sum is not the point at infinity before calling this function. */
+static int rustsecp256k1_v0_10_0_silentpayments_calculate_input_hash_scalar(rustsecp256k1_v0_10_0_scalar *input_hash_scalar, const unsigned char *outpoint_smallest36, rustsecp256k1_v0_10_0_ge *pubkey_sum) {
     rustsecp256k1_v0_10_0_sha256 hash;
     unsigned char pubkey_sum_ser[33];
+    unsigned char input_hash[32];
     size_t len;
-    int ret;
+    int ret, overflow;
 
     rustsecp256k1_v0_10_0_silentpayments_sha256_init_inputs(&hash);
     rustsecp256k1_v0_10_0_sha256_write(&hash, outpoint_smallest36, 36);
     ret = rustsecp256k1_v0_10_0_eckey_pubkey_serialize(pubkey_sum, pubkey_sum_ser, &len, 1);
     VERIFY_CHECK(ret && len == sizeof(pubkey_sum_ser));
-    (void)ret;
     rustsecp256k1_v0_10_0_sha256_write(&hash, pubkey_sum_ser, sizeof(pubkey_sum_ser));
     rustsecp256k1_v0_10_0_sha256_finalize(&hash, input_hash);
+    /* Convert input_hash to a scalar to ensure the value is less than the curve order.
+     *
+     * This can only fail if the output of the hash function is zero or greater than or equal to the curve order, which
+     * happens with negligible probability. Normally, we would use VERIFY_CHECK as opposed to returning an error
+     * since returning an error here would result in an untestable branch in the code. But in this case, we return
+     * an error to ensure strict compliance with BIP0352.
+     */
+    rustsecp256k1_v0_10_0_scalar_set_b32(input_hash_scalar, input_hash, &overflow);
+    ret &= !rustsecp256k1_v0_10_0_scalar_is_zero(input_hash_scalar);
+    return ret & !overflow;
 }
 
-static void rustsecp256k1_v0_10_0_silentpayments_create_shared_secret(const rustsecp256k1_v0_10_0_context *ctx, unsigned char *shared_secret33, const rustsecp256k1_v0_10_0_scalar *secret_component, const rustsecp256k1_v0_10_0_pubkey *public_component) {
+static void rustsecp256k1_v0_10_0_silentpayments_create_shared_secret(const rustsecp256k1_v0_10_0_context *ctx, unsigned char *shared_secret33, const rustsecp256k1_v0_10_0_ge *public_component, const rustsecp256k1_v0_10_0_scalar *secret_component) {
     rustsecp256k1_v0_10_0_gej ss_j;
-    rustsecp256k1_v0_10_0_ge ss, pk;
+    rustsecp256k1_v0_10_0_ge ss;
     size_t len;
     int ret;
-    memset(shared_secret33, 0, 33);
-    /* By the time we call _create_shared_secret, the public_component has been created by us and validated
-     * or loaded from a public_data object and validated, so this call will never fail
-     */
-    rustsecp256k1_v0_10_0_pubkey_load(ctx, &pk, public_component);
 
-    /* Compute shared_secret = tweaked_secret_component * Public_component */
-    rustsecp256k1_v0_10_0_ecmult_const(&ss_j, &pk, secret_component);
+    rustsecp256k1_v0_10_0_ecmult_const(&ss_j, public_component, secret_component);
     rustsecp256k1_v0_10_0_ge_set_gej(&ss, &ss_j);
+    /* We declassify the shared secret group elemement because serializing a group element is a non-constant time operation. */
+    rustsecp256k1_v0_10_0_declassify(ctx, &ss, sizeof(ss));
     /* This can only fail if the shared secret is the point at infinity, which should be
-     * impossible at this point, considering we have already validated the public key and
-     * the secret key being used
+     * impossible at this point considering we have already validated the public key and
+     * the secret key.
      */
     ret = rustsecp256k1_v0_10_0_eckey_pubkey_serialize(&ss, shared_secret33, &len, 1);
+#ifdef VERIFY
     VERIFY_CHECK(ret && len == 33);
+#else
     (void)ret;
+#endif
+
+    /* Leaking these values would break indistinguishability of the transaction, so clear them. */
+    rustsecp256k1_v0_10_0_ge_clear(&ss);
+    rustsecp256k1_v0_10_0_gej_clear(&ss_j);
 }
 
 /** Set hash state to the BIP340 tagged hash midstate for "BIP0352/SharedSecret". */
@@ -102,45 +130,64 @@ static void rustsecp256k1_v0_10_0_silentpayments_sha256_init_sharedsecret(rustse
     hash->bytes = 64;
 }
 
-static void rustsecp256k1_v0_10_0_silentpayments_create_t_k(rustsecp256k1_v0_10_0_scalar *t_k_scalar, const unsigned char *shared_secret33, unsigned int k) {
+static int rustsecp256k1_v0_10_0_silentpayments_create_output_tweak(rustsecp256k1_v0_10_0_scalar *output_tweak_scalar, const unsigned char *shared_secret33, uint32_t k) {
     rustsecp256k1_v0_10_0_sha256 hash;
     unsigned char hash_ser[32];
     unsigned char k_serialized[4];
+    int ret, overflow;
 
-    /* Compute t_k = hash(shared_secret || ser_32(k))  [sha256 with tag "BIP0352/SharedSecret"] */
+    /* Compute hash(shared_secret || ser_32(k))  [sha256 with tag "BIP0352/SharedSecret"] */
     rustsecp256k1_v0_10_0_silentpayments_sha256_init_sharedsecret(&hash);
     rustsecp256k1_v0_10_0_sha256_write(&hash, shared_secret33, 33);
     rustsecp256k1_v0_10_0_write_be32(k_serialized, k);
     rustsecp256k1_v0_10_0_sha256_write(&hash, k_serialized, sizeof(k_serialized));
     rustsecp256k1_v0_10_0_sha256_finalize(&hash, hash_ser);
-    rustsecp256k1_v0_10_0_scalar_set_b32(t_k_scalar, hash_ser, NULL);
-    /* While not technically "secret" data, explicitly clear hash_ser since leaking this would allow an attacker
-     * to identify the resulting transaction as a silent payments transaction and potentially link the transaction
-     * back to the silent payment address
+    /* Convert output_tweak to a scalar to ensure the value is less than the curve order.
+     *
+     * This can only fail if the output of the hash function is zero greater than or equal to the curve order, which
+     * happens with negligible probability. Normally, we would use VERIFY_CHECK as opposed to returning an error
+     * since returning an error here would result in an untestable branch in the code. But in this case, we return
+     * an error to ensure strict compliance with BIP0352.
      */
-    memset(hash_ser, 0, sizeof(hash_ser));
+    rustsecp256k1_v0_10_0_scalar_set_b32(output_tweak_scalar, hash_ser, &overflow);
+    ret = !rustsecp256k1_v0_10_0_scalar_is_zero(output_tweak_scalar);
+    /* Leaking this value would break indistinguishability of the transaction, so clear it. */
+    rustsecp256k1_v0_10_0_memclear_explicit(hash_ser, sizeof(hash_ser));
+    rustsecp256k1_v0_10_0_sha256_clear(&hash);
+    return ret & !overflow;
 }
 
-static int rustsecp256k1_v0_10_0_silentpayments_create_output_pubkey(const rustsecp256k1_v0_10_0_context *ctx, rustsecp256k1_v0_10_0_xonly_pubkey *P_output_xonly, const unsigned char *shared_secret33, const rustsecp256k1_v0_10_0_pubkey *recipient_spend_pubkey, unsigned int k) {
-    rustsecp256k1_v0_10_0_ge P_output_ge;
-    rustsecp256k1_v0_10_0_scalar t_k_scalar;
-    int ret;
-
-    /* Calculate and return P_output_xonly = B_spend + t_k * G
-     * This will fail if B_spend is the point at infinity or if
-     * B_spend + t_k*G is the point at infinity.
+static int rustsecp256k1_v0_10_0_silentpayments_create_output_pubkeys(const rustsecp256k1_v0_10_0_context *ctx, rustsecp256k1_v0_10_0_xonly_pubkey **outputs_xonly, const unsigned char *shared_secret33, const rustsecp256k1_v0_10_0_pubkey **spend_pubkeys, size_t n_spend_pubkeys, uint32_t k) {
+    rustsecp256k1_v0_10_0_ge output_ge;
+    rustsecp256k1_v0_10_0_scalar output_tweak_scalar;
+    size_t i;
+    /* Calculate the output_tweak and convert it to a scalar to ensure the value is less than the curve order.
+     *
+     * Note: _create_output_tweak can only fail if the output of the hash function is greater than or equal to the curve order, which is statistically improbable.
+     * Returning an error here results in an untestable branch in the code, but we do this anyways to ensure strict compliance with BIP0352.
      */
-    rustsecp256k1_v0_10_0_silentpayments_create_t_k(&t_k_scalar, shared_secret33, k);
-    ret = rustsecp256k1_v0_10_0_pubkey_load(ctx, &P_output_ge, recipient_spend_pubkey);
-    ret &= rustsecp256k1_v0_10_0_eckey_pubkey_tweak_add(&P_output_ge, &t_k_scalar);
-    rustsecp256k1_v0_10_0_xonly_pubkey_save(P_output_xonly, &P_output_ge);
+    if (!rustsecp256k1_v0_10_0_silentpayments_create_output_tweak(&output_tweak_scalar, shared_secret33, k)) {
+        return 0;
+    }
+    for (i = 0; i < n_spend_pubkeys; i++) {
+       if (!rustsecp256k1_v0_10_0_pubkey_load(ctx, &output_ge, spend_pubkeys[i])) {
+           rustsecp256k1_v0_10_0_scalar_clear(&output_tweak_scalar);
+           return 0;
+       }
+       /* `tweak_add` only fails if output_tweak_scalar*G = -spend_pubkey. Considering output_tweak is the output of a hash function,
+        * this will happen only with negligible probability for honestly created spend_pubkey, but we handle this
+        * error anyway to protect against this function being called with a malicious inputs, i.e., spend_pubkey = -(_create_output_tweak(shared_secret33, k))*G
+        */
+       if (!rustsecp256k1_v0_10_0_eckey_pubkey_tweak_add(&output_ge, &output_tweak_scalar)) {
+           rustsecp256k1_v0_10_0_scalar_clear(&output_tweak_scalar);
+           return 0;
+       };
+       rustsecp256k1_v0_10_0_xonly_pubkey_save(outputs_xonly[i], &output_ge);
+    }
 
-    /* While not technically "secret" data, explicitly clear t_k since leaking this would allow an attacker
-     * to identify the resulting transaction as a silent payments transaction and potentially link the transaction
-     * back to the silent payment address
-     */
-    rustsecp256k1_v0_10_0_scalar_clear(&t_k_scalar);
-    return ret;
+    /* Leaking this value would break indistinguishability of the transaction, so clear it. */
+    rustsecp256k1_v0_10_0_scalar_clear(&output_tweak_scalar);
+    return 1;
 }
 
 int rustsecp256k1_v0_10_0_silentpayments_sender_create_outputs(
@@ -155,14 +202,14 @@ int rustsecp256k1_v0_10_0_silentpayments_sender_create_outputs(
     size_t n_plain_seckeys
 ) {
     size_t i, k;
-    rustsecp256k1_v0_10_0_scalar a_sum_scalar, addend, input_hash_scalar;
-    rustsecp256k1_v0_10_0_ge A_sum_ge;
-    rustsecp256k1_v0_10_0_gej A_sum_gej;
-    unsigned char input_hash[32];
+    rustsecp256k1_v0_10_0_scalar seckey_sum_scalar, addend, input_hash_scalar;
+    rustsecp256k1_v0_10_0_ge prevouts_pubkey_sum_ge;
+    rustsecp256k1_v0_10_0_gej prevouts_pubkey_sum_gej;
     unsigned char shared_secret[33];
-    rustsecp256k1_v0_10_0_silentpayments_recipient last_recipient;
-    int overflow = 0;
-    int ret = 1;
+    rustsecp256k1_v0_10_0_pubkey current_scan_pubkey;
+    const rustsecp256k1_v0_10_0_pubkey *spend_pubkey_ptrs[1];
+    rustsecp256k1_v0_10_0_xonly_pubkey *generated_output_ptrs[1];
+    int ret, sum_is_zero;
 
     /* Sanity check inputs. */
     VERIFY_CHECK(ctx != NULL);
@@ -170,6 +217,7 @@ int rustsecp256k1_v0_10_0_silentpayments_sender_create_outputs(
     ARG_CHECK(generated_outputs != NULL);
     ARG_CHECK(recipients != NULL);
     ARG_CHECK(n_recipients > 0);
+    ARG_CHECK(outpoint_smallest36 != NULL);
     ARG_CHECK((plain_seckeys != NULL) || (taproot_seckeys != NULL));
     if (taproot_seckeys != NULL) {
         ARG_CHECK(n_taproot_seckeys > 0);
@@ -181,67 +229,111 @@ int rustsecp256k1_v0_10_0_silentpayments_sender_create_outputs(
     } else {
         ARG_CHECK(n_plain_seckeys == 0);
     }
-    ARG_CHECK(outpoint_smallest36 != NULL);
-    /* ensure the index field is set correctly */
     for (i = 0; i < n_recipients; i++) {
         ARG_CHECK(recipients[i]->index == i);
     }
 
-    /* Compute input private keys sum: a_sum = a_1 + a_2 + ... + a_n */
-    a_sum_scalar = rustsecp256k1_v0_10_0_scalar_zero;
+    seckey_sum_scalar = rustsecp256k1_v0_10_0_scalar_zero;
     for (i = 0; i < n_plain_seckeys; i++) {
-        /* TODO: in other places where _set_b32_seckey is called, its normally followed by a _cmov call
-         * Do we need that here and if so, is it better to call it after the loop is finished?
-         */
-        ret &= rustsecp256k1_v0_10_0_scalar_set_b32_seckey(&addend, plain_seckeys[i]);
-        rustsecp256k1_v0_10_0_scalar_add(&a_sum_scalar, &a_sum_scalar, &addend);
+        ret = rustsecp256k1_v0_10_0_scalar_set_b32_seckey(&addend, plain_seckeys[i]);
+        rustsecp256k1_v0_10_0_declassify(ctx, &ret, sizeof(ret));
+        if (!ret) {
+            rustsecp256k1_v0_10_0_scalar_clear(&addend);
+            rustsecp256k1_v0_10_0_scalar_clear(&seckey_sum_scalar);
+            return 0;
+        }
+        rustsecp256k1_v0_10_0_scalar_add(&seckey_sum_scalar, &seckey_sum_scalar, &addend);
     }
-    /* private keys used for taproot outputs have to be negated if they resulted in an odd point */
+    /* Secret keys used for taproot outputs have to be negated if they result in an odd point. This is to ensure
+     * the sender and recipient can arrive at the same shared secret when using x-only public keys. */
     for (i = 0; i < n_taproot_seckeys; i++) {
         rustsecp256k1_v0_10_0_ge addend_point;
-        /* TODO: why don't we need _cmov here after calling keypair_load? Because the ret is declassified? */
-        ret &= rustsecp256k1_v0_10_0_keypair_load(ctx, &addend, &addend_point, taproot_seckeys[i]);
+        ret = rustsecp256k1_v0_10_0_keypair_load(ctx, &addend, &addend_point, taproot_seckeys[i]);
+        rustsecp256k1_v0_10_0_declassify(ctx, &ret, sizeof(ret));
+        if (!ret) {
+            rustsecp256k1_v0_10_0_scalar_clear(&addend);
+            rustsecp256k1_v0_10_0_scalar_clear(&seckey_sum_scalar);
+            return 0;
+        }
         if (rustsecp256k1_v0_10_0_fe_is_odd(&addend_point.y)) {
             rustsecp256k1_v0_10_0_scalar_negate(&addend, &addend);
         }
-        rustsecp256k1_v0_10_0_scalar_add(&a_sum_scalar, &a_sum_scalar, &addend);
+        rustsecp256k1_v0_10_0_scalar_add(&seckey_sum_scalar, &seckey_sum_scalar, &addend);
     }
-    /* If there are any failures in loading/summing up the secret keys, fail early */
-    if (!ret || rustsecp256k1_v0_10_0_scalar_is_zero(&a_sum_scalar)) {
+    /* If there are any failures in loading/summing up the secret keys, fail early. */
+    sum_is_zero = rustsecp256k1_v0_10_0_scalar_is_zero(&seckey_sum_scalar);
+    rustsecp256k1_v0_10_0_declassify(ctx, &sum_is_zero, sizeof(sum_is_zero));
+    rustsecp256k1_v0_10_0_scalar_clear(&addend);
+    if (sum_is_zero) {
+        rustsecp256k1_v0_10_0_scalar_clear(&seckey_sum_scalar);
         return 0;
     }
-    /* Compute input_hash = hash(outpoint_L || (a_sum * G)) */
-    rustsecp256k1_v0_10_0_ecmult_gen(&ctx->ecmult_gen_ctx, &A_sum_gej, &a_sum_scalar);
-    rustsecp256k1_v0_10_0_ge_set_gej(&A_sum_ge, &A_sum_gej);
+    rustsecp256k1_v0_10_0_ecmult_gen(&ctx->ecmult_gen_ctx, &prevouts_pubkey_sum_gej, &seckey_sum_scalar);
+    rustsecp256k1_v0_10_0_ge_set_gej(&prevouts_pubkey_sum_ge, &prevouts_pubkey_sum_gej);
+    /* We declassify the pubkey sum because serializing a group element (done in the
+     * `_calculate_input_hash_scalar` call following) is not a constant-time operation.
+     */
+    rustsecp256k1_v0_10_0_declassify(ctx, &prevouts_pubkey_sum_ge, sizeof(prevouts_pubkey_sum_ge));
 
-    /* Calculate the input hash and tweak a_sum, i.e., a_sum_tweaked = a_sum * input_hash */
-    rustsecp256k1_v0_10_0_silentpayments_calculate_input_hash(input_hash, outpoint_smallest36, &A_sum_ge);
-    rustsecp256k1_v0_10_0_scalar_set_b32(&input_hash_scalar, input_hash, &overflow);
-    ret &= !overflow;
-    rustsecp256k1_v0_10_0_scalar_mul(&a_sum_scalar, &a_sum_scalar, &input_hash_scalar);
+    /* Calculate the input_hash and convert it to a scalar so that it can be multiplied with the summed up private keys, i.e., a_sum = a_sum * input_hash.
+     * By multiplying the scalars together first, we can save an elliptic curve multiplication.
+     *
+     * Note: _input_hash_scalar can only fail if the output of the hash function is greater than or equal to the curve order, which is statistically improbable.
+     * Returning an error here results in an untestable branch in the code, but we do this anyways to ensure strict compliance with BIP0352.
+     */
+    if (!rustsecp256k1_v0_10_0_silentpayments_calculate_input_hash_scalar(&input_hash_scalar, outpoint_smallest36, &prevouts_pubkey_sum_ge)) {
+        rustsecp256k1_v0_10_0_scalar_clear(&seckey_sum_scalar);
+        return 0;
+    }
+    rustsecp256k1_v0_10_0_scalar_mul(&seckey_sum_scalar, &seckey_sum_scalar, &input_hash_scalar);
+    /* _recipient_sort sorts the array of recipients in place by their scan public keys (lexicographically).
+     * This ensures that all recipients with the same scan public key are grouped together, as specified in BIP0352.
+     *
+     * More specifically, this ensures `k` is incremented from 0 to the number of requested outputs for each recipient group,
+     * where a recipient group is all addresses with the same scan public key.
+     */
     rustsecp256k1_v0_10_0_silentpayments_recipient_sort(ctx, recipients, n_recipients);
-    last_recipient = *recipients[0];
-    k = 0;
+    current_scan_pubkey = recipients[0]->scan_pubkey;
+    k = 0;  /* This is a dead store but clang will emit a false positive warning if we omit it. */
     for (i = 0; i < n_recipients; i++) {
-        if ((rustsecp256k1_v0_10_0_ec_pubkey_cmp(ctx, &last_recipient.scan_pubkey, &recipients[i]->scan_pubkey) != 0) || (i == 0)) {
-            /* if we are on a different scan pubkey, its time to recreate the the shared secret and reset k to 0 */
-            rustsecp256k1_v0_10_0_silentpayments_create_shared_secret(ctx, shared_secret, &a_sum_scalar, &recipients[i]->scan_pubkey);
+        if ((i == 0) || (rustsecp256k1_v0_10_0_ec_pubkey_cmp(ctx, &current_scan_pubkey, &recipients[i]->scan_pubkey) != 0)) {
+            /* If we are on a different scan pubkey, its time to recreate the shared secret and reset k to 0.
+             * It's very unlikely the scan public key is invalid by this point, since this means the caller would
+             * have created the _silentpayments_recipient object incorrectly, but just to be sure we still check that
+             * the public key is valid.
+             */
+            rustsecp256k1_v0_10_0_ge pk;
+            if (!rustsecp256k1_v0_10_0_pubkey_load(ctx, &pk, &recipients[i]->scan_pubkey)) {
+                rustsecp256k1_v0_10_0_scalar_clear(&seckey_sum_scalar);
+                /* Leaking this value would break indistinguishability of the transaction, so clear it. */
+                rustsecp256k1_v0_10_0_memclear_explicit(&shared_secret, sizeof(shared_secret));
+                return 0;
+            }
+            rustsecp256k1_v0_10_0_silentpayments_create_shared_secret(ctx, shared_secret, &pk, &seckey_sum_scalar);
             k = 0;
         }
-        ret &= rustsecp256k1_v0_10_0_silentpayments_create_output_pubkey(ctx, generated_outputs[recipients[i]->index], shared_secret, &recipients[i]->spend_pubkey, k);
-        k++;
-        last_recipient = *recipients[i];
+        generated_output_ptrs[0] = generated_outputs[recipients[i]->index];
+        spend_pubkey_ptrs[0] = &recipients[i]->spend_pubkey;
+        if (!rustsecp256k1_v0_10_0_silentpayments_create_output_pubkeys(ctx, generated_output_ptrs, shared_secret, spend_pubkey_ptrs, 1, k)) {
+            rustsecp256k1_v0_10_0_scalar_clear(&seckey_sum_scalar);
+            rustsecp256k1_v0_10_0_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            return 0;
+        }
+        /* BIP0352 specifies that k is serialized as a 4 byte (32 bit) value, so we check to make
+         * sure we are not exceeding the max value for a uint32 before incrementing k.
+         * In practice, this should never happen as it would be impossible to create a transaction
+         * with this many outputs.
+         */
+        if (k < UINT32_MAX) {
+            k++;
+        } else {
+            return 0;
+        }
+        current_scan_pubkey = recipients[i]->scan_pubkey;
     }
-    /* Explicitly clear variables containing secret data */
-    rustsecp256k1_v0_10_0_scalar_clear(&addend);
-    rustsecp256k1_v0_10_0_scalar_clear(&a_sum_scalar);
-
-    /* While technically not "secret data," explicitly clear the shared secret since leaking this
-     * could result in a third party being able to identify the transaction as a silent payments transaction
-     * and potentially link the transaction back to a silent payment address
-     */
-    memset(&shared_secret, 0, sizeof(shared_secret));
-    return ret;
+    rustsecp256k1_v0_10_0_scalar_clear(&seckey_sum_scalar);
+    rustsecp256k1_v0_10_0_memclear_explicit(&shared_secret, sizeof(shared_secret));
+    return 1;
 }
 
 /** Set hash state to the BIP340 tagged hash midstate for "BIP0352/Label". */
@@ -259,7 +351,7 @@ static void rustsecp256k1_v0_10_0_silentpayments_sha256_init_label(rustsecp256k1
     hash->bytes = 64;
 }
 
-int rustsecp256k1_v0_10_0_silentpayments_recipient_create_label_tweak(const rustsecp256k1_v0_10_0_context *ctx, rustsecp256k1_v0_10_0_pubkey *label, unsigned char *label_tweak32, const unsigned char *recipient_scan_key, unsigned int m) {
+int rustsecp256k1_v0_10_0_silentpayments_recipient_create_label(const rustsecp256k1_v0_10_0_context *ctx, rustsecp256k1_v0_10_0_pubkey *label, unsigned char *label_tweak32, const unsigned char *scan_key32, const uint32_t m) {
     rustsecp256k1_v0_10_0_sha256 hash;
     unsigned char m_serialized[4];
 
@@ -267,53 +359,86 @@ int rustsecp256k1_v0_10_0_silentpayments_recipient_create_label_tweak(const rust
     VERIFY_CHECK(ctx != NULL);
     ARG_CHECK(label != NULL);
     ARG_CHECK(label_tweak32 != NULL);
-    ARG_CHECK(recipient_scan_key != NULL);
+    ARG_CHECK(scan_key32 != NULL);
 
-    /* Compute label_tweak = hash(ser_256(b_scan) || ser_32(m))  [sha256 with tag "BIP0352/Label"] */
+    /* Compute hash(ser_256(b_scan) || ser_32(m))  [sha256 with tag "BIP0352/Label"] */
     rustsecp256k1_v0_10_0_silentpayments_sha256_init_label(&hash);
-    rustsecp256k1_v0_10_0_sha256_write(&hash, recipient_scan_key, 32);
+    rustsecp256k1_v0_10_0_sha256_write(&hash, scan_key32, 32);
     rustsecp256k1_v0_10_0_write_be32(m_serialized, m);
     rustsecp256k1_v0_10_0_sha256_write(&hash, m_serialized, sizeof(m_serialized));
     rustsecp256k1_v0_10_0_sha256_finalize(&hash, label_tweak32);
 
-    /* Compute label = label_tweak * G */
+    rustsecp256k1_v0_10_0_memclear_explicit(m_serialized, sizeof(m_serialized));
+    rustsecp256k1_v0_10_0_sha256_clear(&hash);
     return rustsecp256k1_v0_10_0_ec_pubkey_create(ctx, label, label_tweak32);
 }
 
-int rustsecp256k1_v0_10_0_silentpayments_recipient_create_labelled_spend_pubkey(const rustsecp256k1_v0_10_0_context *ctx, rustsecp256k1_v0_10_0_pubkey *labelled_spend_pubkey, const rustsecp256k1_v0_10_0_pubkey *recipient_spend_pubkey, const rustsecp256k1_v0_10_0_pubkey *label) {
-    rustsecp256k1_v0_10_0_ge B_m, label_addend;
+int rustsecp256k1_v0_10_0_silentpayments_recipient_create_labeled_spend_pubkey(const rustsecp256k1_v0_10_0_context *ctx, rustsecp256k1_v0_10_0_pubkey *labeled_spend_pubkey, const rustsecp256k1_v0_10_0_pubkey *unlabeled_spend_pubkey, const rustsecp256k1_v0_10_0_pubkey *label) {
+    rustsecp256k1_v0_10_0_ge labeled_spend_pubkey_ge, label_addend;
     rustsecp256k1_v0_10_0_gej result_gej;
     rustsecp256k1_v0_10_0_ge result_ge;
     int ret;
 
     /* Sanity check inputs. */
     VERIFY_CHECK(ctx != NULL);
-    ARG_CHECK(labelled_spend_pubkey != NULL);
-    ARG_CHECK(recipient_spend_pubkey != NULL);
+    ARG_CHECK(labeled_spend_pubkey != NULL);
+    ARG_CHECK(unlabeled_spend_pubkey != NULL);
     ARG_CHECK(label != NULL);
 
-    /* Calculate B_m = B_spend + label
+    /* Calculate labeled_spend_pubkey = spend_pubkey + label.
      * If either the label or spend public key is an invalid public key,
      * return early
      */
-    ret = rustsecp256k1_v0_10_0_pubkey_load(ctx, &B_m, recipient_spend_pubkey);
+    ret = rustsecp256k1_v0_10_0_pubkey_load(ctx, &labeled_spend_pubkey_ge, unlabeled_spend_pubkey);
     ret &= rustsecp256k1_v0_10_0_pubkey_load(ctx, &label_addend, label);
     if (!ret) {
-        return ret;
+        return 0;
     }
-    rustsecp256k1_v0_10_0_gej_set_ge(&result_gej, &B_m);
+    rustsecp256k1_v0_10_0_gej_set_ge(&result_gej, &labeled_spend_pubkey_ge);
     rustsecp256k1_v0_10_0_gej_add_ge_var(&result_gej, &result_gej, &label_addend, NULL);
+    if (rustsecp256k1_v0_10_0_gej_is_infinity(&result_gej)) {
+        return 0;
+    }
 
-    /* Serialize B_m */
-    rustsecp256k1_v0_10_0_ge_set_gej(&result_ge, &result_gej);
-    rustsecp256k1_v0_10_0_pubkey_save(labelled_spend_pubkey, &result_ge);
+    rustsecp256k1_v0_10_0_ge_set_gej_var(&result_ge, &result_gej);
+    rustsecp256k1_v0_10_0_pubkey_save(labeled_spend_pubkey, &result_ge);
 
     return 1;
 }
 
-int rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_create(
+/** An explanation of the prevouts_summary object and its usage:
+ *
+ *  The prevouts_summary object contains:
+ *
+ *  [magic: 4 bytes][boolean: 1 byte][prevouts_pubkey_sum: 64 bytes][input_hash: 32 bytes]
+ *
+ *  The magic bytes are checked by functions using the prevouts_summary object to
+ *  check that the prevouts_summary object was initialized correctly.
+ *
+ *  The boolean (combined) indicates whether or not the summed prevout public keys and the
+ *  input_hash scalar have already been combined or are both included. The reason
+ *  for keeping input_hash and the summed prevout public keys separate is so that an elliptic
+ *  curve multiplication can be avoided when creating the shared secret, i.e.,
+ *  (recipient_scan_key * input_hash) * prevouts_pubkey_sum.
+ *
+ *  But when storing the prevouts_summary object, either to send to light clients or for
+ *  wallet rescans, we can save 32-bytes by combining the input_hash and prevouts_pubkey_sum and saving
+ *  the resulting point serialized as a compressed public key, i.e., input_hash * prevouts_pubkey_sum.
+ *
+ *  For each function:
+ *
+ *  - `_recipient_prevouts_summary_create` always creates a prevouts_summary object with combined = false
+ *  - `_recipient_prevouts_summary_serialize` multiplies the input_hash into the summed public key before
+ *     serializing the resulting point as a compressed public key, if combined = false. If combined = true,
+ *     the point is serialized back into a compressed public key.
+ *  - `_recipient_prevouts_summary_parse` assumes the input represents a previously serialized
+ *    prevouts_summary object and always deserializes into a prevouts_summary object with combined = true
+ *    (and the input_hash portion zeroed out).
+ */
+
+int rustsecp256k1_v0_10_0_silentpayments_recipient_prevouts_summary_create(
     const rustsecp256k1_v0_10_0_context *ctx,
-    rustsecp256k1_v0_10_0_silentpayments_public_data *public_data,
+    rustsecp256k1_v0_10_0_silentpayments_prevouts_summary *prevouts_summary,
     const unsigned char *outpoint_smallest36,
     const rustsecp256k1_v0_10_0_xonly_pubkey * const *xonly_pubkeys,
     size_t n_xonly_pubkeys,
@@ -321,15 +446,13 @@ int rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_create(
     size_t n_plain_pubkeys
 ) {
     size_t i;
-    size_t pubkeylen = 65;
-    rustsecp256k1_v0_10_0_ge A_sum_ge, addend;
-    rustsecp256k1_v0_10_0_gej A_sum_gej;
-    unsigned char input_hash_local[32];
-    int ret = 1;
+    rustsecp256k1_v0_10_0_ge prevouts_pubkey_sum_ge, addend;
+    rustsecp256k1_v0_10_0_gej prevouts_pubkey_sum_gej;
+    rustsecp256k1_v0_10_0_scalar input_hash_scalar;
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
-    ARG_CHECK(public_data != NULL);
+    ARG_CHECK(prevouts_summary != NULL);
     ARG_CHECK(outpoint_smallest36 != NULL);
     ARG_CHECK((plain_pubkeys != NULL) || (xonly_pubkeys != NULL));
     if (xonly_pubkeys != NULL) {
@@ -342,79 +465,108 @@ int rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_create(
     } else {
         ARG_CHECK(n_plain_pubkeys == 0);
     }
-    memset(input_hash_local, 0, 32);
 
-    /* Compute input public keys sum: A_sum = A_1 + A_2 + ... + A_n */
-    rustsecp256k1_v0_10_0_gej_set_infinity(&A_sum_gej);
+    /* Compute prevouts_pubkey_sum = A_1 + A_2 + ... + A_n.
+     *
+     * Since an attacker can maliciously craft transactions where the public keys sum to zero, fail early here
+     * to avoid making the caller do extra work, e.g., when building an index or scanning a malicious transaction.
+     *
+     * This will also fail if any of the provided prevout public keys are malformed.
+     */
+    rustsecp256k1_v0_10_0_gej_set_infinity(&prevouts_pubkey_sum_gej);
     for (i = 0; i < n_plain_pubkeys; i++) {
-        ret &= rustsecp256k1_v0_10_0_pubkey_load(ctx, &addend, plain_pubkeys[i]);
-        rustsecp256k1_v0_10_0_gej_add_ge_var(&A_sum_gej, &A_sum_gej, &addend, NULL);
+        if (!rustsecp256k1_v0_10_0_pubkey_load(ctx, &addend, plain_pubkeys[i])) {
+            return 0;
+        }
+        rustsecp256k1_v0_10_0_gej_add_ge_var(&prevouts_pubkey_sum_gej, &prevouts_pubkey_sum_gej, &addend, NULL);
     }
     for (i = 0; i < n_xonly_pubkeys; i++) {
-        ret &= rustsecp256k1_v0_10_0_xonly_pubkey_load(ctx, &addend, xonly_pubkeys[i]);
-        rustsecp256k1_v0_10_0_gej_add_ge_var(&A_sum_gej, &A_sum_gej, &addend, NULL);
+        if (!rustsecp256k1_v0_10_0_xonly_pubkey_load(ctx, &addend, xonly_pubkeys[i])) {
+            return 0;
+        }
+        rustsecp256k1_v0_10_0_gej_add_ge_var(&prevouts_pubkey_sum_gej, &prevouts_pubkey_sum_gej, &addend, NULL);
     }
-    /* Since an attacker can maliciously craft transactions where the public keys sum to zero, fail early here
-     * to avoid making the caller do extra work, e.g., when building an index or scanning many malicious transactions
-     */
-    if (rustsecp256k1_v0_10_0_gej_is_infinity(&A_sum_gej)) {
+    if (rustsecp256k1_v0_10_0_gej_is_infinity(&prevouts_pubkey_sum_gej)) {
         return 0;
     }
-    /* Compute input_hash = hash(outpoint_L || A_sum) */
-    rustsecp256k1_v0_10_0_ge_set_gej(&A_sum_ge, &A_sum_gej);
-    rustsecp256k1_v0_10_0_silentpayments_calculate_input_hash(input_hash_local, outpoint_smallest36, &A_sum_ge);
-    /* serialize the public_data struct */
-    public_data->data[0] = 0;
-    rustsecp256k1_v0_10_0_eckey_pubkey_serialize(&A_sum_ge, &public_data->data[1], &pubkeylen, 0);
-    memcpy(&public_data->data[1 + pubkeylen], input_hash_local, 32);
-    return ret;
-}
-
-static int rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_load_pubkey(const rustsecp256k1_v0_10_0_context *ctx, rustsecp256k1_v0_10_0_pubkey *pubkey, const rustsecp256k1_v0_10_0_silentpayments_public_data *public_data) {
-    size_t pubkeylen = 65;
-    return rustsecp256k1_v0_10_0_ec_pubkey_parse(ctx, pubkey, &public_data->data[1], pubkeylen);
-}
-
-static void rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_load_input_hash(unsigned char *input_hash, const rustsecp256k1_v0_10_0_silentpayments_public_data *public_data) {
-    size_t pubkeylen = 65;
-    memcpy(input_hash, &public_data->data[1 + pubkeylen], 32);
-}
-
-int rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_serialize(const rustsecp256k1_v0_10_0_context *ctx, unsigned char *output33, const rustsecp256k1_v0_10_0_silentpayments_public_data *public_data) {
-    rustsecp256k1_v0_10_0_pubkey pubkey;
-    unsigned char input_hash[32];
-    size_t pubkeylen = 33;
-    int ret = 1;
-
-    VERIFY_CHECK(ctx != NULL);
-    ARG_CHECK(output33 != NULL);
-    ARG_CHECK(public_data != NULL);
-    /* Only allow public_data to be serialized if it has the hash and the summed public key
-     * This helps protect against accidentally serialiazing just a the summed public key A
+    rustsecp256k1_v0_10_0_ge_set_gej_var(&prevouts_pubkey_sum_ge, &prevouts_pubkey_sum_gej);
+    /* Calculate the input_hash and convert it to a scalar to ensure the value is less than the curve order.
+     *
+     * Note: _input_hash_scalar can only fail if the output of the hash function is greater than or equal to the curve order, which is statistically improbable.
+     * Returning an error here results in an untestable branch in the code, but we do this anyways to ensure strict compliance with BIP0352.
      */
-    ARG_CHECK(public_data->data[0] == 0);
-    ret &= rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_load_pubkey(ctx, &pubkey, public_data);
-    rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_load_input_hash(input_hash, public_data);
-    ret &= rustsecp256k1_v0_10_0_ec_pubkey_tweak_mul(ctx, &pubkey, input_hash);
-    rustsecp256k1_v0_10_0_ec_pubkey_serialize(ctx, output33, &pubkeylen, &pubkey, SECP256K1_EC_COMPRESSED);
-    return ret;
-}
-
-int rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_parse(const rustsecp256k1_v0_10_0_context *ctx, rustsecp256k1_v0_10_0_silentpayments_public_data *public_data, const unsigned char *input33) {
-    size_t inputlen = 33;
-    size_t pubkeylen = 65;
-    rustsecp256k1_v0_10_0_pubkey pubkey;
-
-    VERIFY_CHECK(ctx != NULL);
-    ARG_CHECK(public_data != NULL);
-    ARG_CHECK(input33 != NULL);
-    /* Since an attacker can send us malicious data that looks like a serialized public key but is not, fail early */
-    if (!rustsecp256k1_v0_10_0_ec_pubkey_parse(ctx, &pubkey, input33, inputlen)) {
+    if (!rustsecp256k1_v0_10_0_silentpayments_calculate_input_hash_scalar(&input_hash_scalar, outpoint_smallest36, &prevouts_pubkey_sum_ge)) {
         return 0;
     }
-    public_data->data[0] = 1;
-    rustsecp256k1_v0_10_0_ec_pubkey_serialize(ctx, &public_data->data[1], &pubkeylen, &pubkey, SECP256K1_EC_UNCOMPRESSED);
-    memset(&public_data->data[1 + pubkeylen], 0, 32);
+    memcpy(&prevouts_summary->data[0], rustsecp256k1_v0_10_0_silentpayments_prevouts_summary_magic, 4);
+    prevouts_summary->data[4] = 0;
+    rustsecp256k1_v0_10_0_ge_to_bytes(&prevouts_summary->data[5], &prevouts_pubkey_sum_ge);
+    rustsecp256k1_v0_10_0_scalar_get_b32(&prevouts_summary->data[5 + 64], &input_hash_scalar);
+    return 1;
+}
+
+int rustsecp256k1_v0_10_0_silentpayments_recipient_prevouts_summary_serialize(const rustsecp256k1_v0_10_0_context *ctx, unsigned char *output, size_t size, const rustsecp256k1_v0_10_0_silentpayments_prevouts_summary *prevouts_summary, unsigned int flags) {
+    rustsecp256k1_v0_10_0_ge ge;
+    int ret, combined, compressed;
+
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(output != NULL);
+    ARG_CHECK(size == 33 || size == 65);
+    ARG_CHECK(prevouts_summary != NULL);
+    ARG_CHECK(flags == SECP256K1_EC_COMPRESSED || flags == SECP256K1_EC_UNCOMPRESSED);
+    if (flags == SECP256K1_EC_COMPRESSED) {
+        ARG_CHECK(size == 33);
+    }
+    if (flags == SECP256K1_EC_UNCOMPRESSED) {
+        ARG_CHECK(size == 65);
+    }
+    ARG_CHECK(rustsecp256k1_v0_10_0_memcmp_var(&prevouts_summary->data[0], rustsecp256k1_v0_10_0_silentpayments_prevouts_summary_magic, 4) == 0);
+    if (flags == SECP256K1_EC_COMPRESSED) {
+        compressed = 1;
+    } else {
+        compressed = 0;
+    }
+    /* These functions should never fail at this point considering:
+     *   - loading the pubkey and input hash can only fail if the prevouts_summary object was created incorrectly
+     *     and we already check for this above.
+     *   - `_tweak_mul` can only fail if input_hash_scalar is zero, but assuming the prevouts_summary object
+     *     was created correctly, this is impossible because input_hash_scalar is the output of a hash function.
+     *   - `_eckey_pubkey_serialize` can only fail if the point we are trying to serialize is the point at infinity.
+     *
+     *   Note: we don't verify that the input hash is less than the curve order since this is verified when the
+     *   prevouts_summary object is created.
+     */
+    rustsecp256k1_v0_10_0_ge_from_bytes(&ge, &prevouts_summary->data[5]);
+    combined = (int)prevouts_summary->data[4];
+    ret = 1;
+    if (!combined) {
+        rustsecp256k1_v0_10_0_scalar input_hash_scalar;
+        rustsecp256k1_v0_10_0_scalar_set_b32(&input_hash_scalar, &prevouts_summary->data[5 + 64], NULL);
+        ret &= rustsecp256k1_v0_10_0_eckey_pubkey_tweak_mul(&ge, &input_hash_scalar);
+    }
+    ret &= rustsecp256k1_v0_10_0_eckey_pubkey_serialize(&ge, output, &size, compressed);
+    (void)ret;
+    return 1;
+}
+
+int rustsecp256k1_v0_10_0_silentpayments_recipient_prevouts_summary_parse(const rustsecp256k1_v0_10_0_context *ctx, rustsecp256k1_v0_10_0_silentpayments_prevouts_summary *prevouts_summary, const unsigned char *input, size_t inputlen) {
+    rustsecp256k1_v0_10_0_ge pk;
+
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(prevouts_summary != NULL);
+    ARG_CHECK(input != NULL);
+    ARG_CHECK(inputlen == 33 || inputlen == 65);
+    /* Since an attacker can send us malicious data that looks like a serialized public key but is not, fail early. */
+    if (!rustsecp256k1_v0_10_0_eckey_pubkey_parse(&pk, input, inputlen)) {
+        return 0;
+    }
+    /* A serialized prevouts_summary will always have the input_hash multiplied in, so we set combined = true.
+     * Additionally, we zero out the 32 bytes used to represent the input_hash.
+     */
+    memcpy(&prevouts_summary->data[0], rustsecp256k1_v0_10_0_silentpayments_prevouts_summary_magic, 4);
+    prevouts_summary->data[4] = 1;
+    rustsecp256k1_v0_10_0_ge_to_bytes(&prevouts_summary->data[5], &pk);
+    memset(&prevouts_summary->data[5 + 64], 0, 32);
     return 1;
 }
 
@@ -422,21 +574,19 @@ int rustsecp256k1_v0_10_0_silentpayments_recipient_scan_outputs(
     const rustsecp256k1_v0_10_0_context *ctx,
     rustsecp256k1_v0_10_0_silentpayments_found_output **found_outputs, size_t *n_found_outputs,
     const rustsecp256k1_v0_10_0_xonly_pubkey * const *tx_outputs, size_t n_tx_outputs,
-    const unsigned char *recipient_scan_key,
-    const rustsecp256k1_v0_10_0_silentpayments_public_data *public_data,
-    const rustsecp256k1_v0_10_0_pubkey *recipient_spend_pubkey,
+    const unsigned char *scan_key32,
+    const rustsecp256k1_v0_10_0_silentpayments_prevouts_summary *prevouts_summary,
+    const rustsecp256k1_v0_10_0_pubkey *spend_pubkey,
     const rustsecp256k1_v0_10_0_silentpayments_label_lookup label_lookup,
     const void *label_context
 ) {
-    rustsecp256k1_v0_10_0_scalar t_k_scalar, rsk_scalar;
-    rustsecp256k1_v0_10_0_ge label_ge, recipient_spend_pubkey_ge;
-    rustsecp256k1_v0_10_0_pubkey A_sum;
-    rustsecp256k1_v0_10_0_xonly_pubkey P_output_xonly;
+    rustsecp256k1_v0_10_0_scalar output_tweak_scalar, scan_key_scalar;
+    rustsecp256k1_v0_10_0_ge label_ge, spend_pubkey_ge, prevouts_pubkey_sum_ge;
+    rustsecp256k1_v0_10_0_xonly_pubkey output_xonly;
     unsigned char shared_secret[33];
     const unsigned char *label_tweak = NULL;
-    size_t i, k, n_found, found_idx;
-    int found, combined;
-    int ret = 1;
+    size_t i, j, k, n_found, found_idx;
+    int found, combined, valid_scan_key, ret;
 
     /* Sanity check inputs */
     VERIFY_CHECK(ctx != NULL);
@@ -444,168 +594,204 @@ int rustsecp256k1_v0_10_0_silentpayments_recipient_scan_outputs(
     ARG_CHECK(n_found_outputs != NULL);
     ARG_CHECK(tx_outputs != NULL);
     ARG_CHECK(n_tx_outputs > 0);
-    ARG_CHECK(recipient_scan_key != NULL);
-    ARG_CHECK(public_data != NULL);
-    ARG_CHECK(recipient_spend_pubkey != NULL);
-    if (label_lookup != NULL) {
-        ARG_CHECK(label_context != NULL);
-    } else {
-        ARG_CHECK(label_context == NULL);
+    ARG_CHECK(scan_key32 != NULL);
+    ARG_CHECK(prevouts_summary != NULL);
+    ARG_CHECK(rustsecp256k1_v0_10_0_memcmp_var(&prevouts_summary->data[0], rustsecp256k1_v0_10_0_silentpayments_prevouts_summary_magic, 4) == 0);
+    ARG_CHECK(spend_pubkey != NULL);
+    /* Passing a context without a lookup function is non-sensical */
+    if (label_context != NULL) {
+        ARG_CHECK(label_lookup != NULL);
     }
-    /* TODO: do we need a _cmov call here to avoid leaking information about the scan key?
-     * Recall: a scan key isnt really "secret" data in that leaking the scan key will only leak privacy
-     * In this respect, a scan key is functionally equivalent to an xpub
-     */
-    ret &= rustsecp256k1_v0_10_0_scalar_set_b32_seckey(&rsk_scalar, recipient_scan_key);
-    ret &= rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_load_pubkey(ctx, &A_sum, public_data);
-    ret &= rustsecp256k1_v0_10_0_pubkey_load(ctx, &recipient_spend_pubkey_ge, recipient_spend_pubkey);
-    /* If there is something wrong with the recipient scan key, recipient spend pubkey, or the public data, return early */
-    if (!ret) {
+    valid_scan_key = rustsecp256k1_v0_10_0_scalar_set_b32_seckey(&scan_key_scalar, scan_key32);
+    rustsecp256k1_v0_10_0_declassify(ctx, &valid_scan_key, sizeof(valid_scan_key));
+    if (!valid_scan_key) {
+        rustsecp256k1_v0_10_0_scalar_clear(&scan_key_scalar);
         return 0;
     }
-    combined = (int)public_data->data[0];
+    rustsecp256k1_v0_10_0_ge_from_bytes(&prevouts_pubkey_sum_ge, &prevouts_summary->data[5]);
+    combined = (int)prevouts_summary->data[4];
     if (!combined) {
-        unsigned char input_hash[32];
         rustsecp256k1_v0_10_0_scalar input_hash_scalar;
-        int overflow = 0;
-
-        rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_load_input_hash(input_hash, public_data);
-        rustsecp256k1_v0_10_0_scalar_set_b32(&input_hash_scalar, input_hash, &overflow);
-        rustsecp256k1_v0_10_0_scalar_mul(&rsk_scalar, &rsk_scalar, &input_hash_scalar);
-        ret &= !overflow;
+        rustsecp256k1_v0_10_0_scalar_set_b32(&input_hash_scalar, &prevouts_summary->data[5 + 64], NULL);
+        rustsecp256k1_v0_10_0_scalar_mul(&scan_key_scalar, &scan_key_scalar, &input_hash_scalar);
     }
-    rustsecp256k1_v0_10_0_silentpayments_create_shared_secret(ctx, shared_secret, &rsk_scalar, &A_sum);
+    ret = rustsecp256k1_v0_10_0_pubkey_load(ctx, &spend_pubkey_ge, spend_pubkey);
+    if (!ret) {
+        rustsecp256k1_v0_10_0_scalar_clear(&scan_key_scalar);
+        return 0;
+    }
+    rustsecp256k1_v0_10_0_silentpayments_create_shared_secret(ctx, shared_secret, &prevouts_pubkey_sum_ge, &scan_key_scalar);
+    /* Clear the scan_key_scalar since we no longer need it and leaking this value would break indistinguishability of the transaction. */
+    rustsecp256k1_v0_10_0_scalar_clear(&scan_key_scalar);
 
     found_idx = 0;
     n_found = 0;
     k = 0;
-    while (1) {
-        rustsecp256k1_v0_10_0_ge P_output_ge = recipient_spend_pubkey_ge;
-        /* Calculate t_k = hash(shared_secret || ser_32(k)) */
-        rustsecp256k1_v0_10_0_silentpayments_create_t_k(&t_k_scalar, shared_secret, k);
-
-        /* Calculate P_output = B_spend + t_k * G
-         * This can fail if t_k overflows the curver order, but this is statistically improbable
+    for (i = 0; i <= n_tx_outputs; i++) {
+        rustsecp256k1_v0_10_0_ge output_ge = spend_pubkey_ge;
+        /* Calculate the output_tweak and convert it to a scalar to ensure the value is less than the curve order.
+         *
+         * Note: _create_output_tweak can only fail if the output of the hash function is greater than or equal to the curve order, which is statistically improbable.
+         * Returning an error here results in an untestable branch in the code, but we do this anyways to ensure strict compliance with BIP0352.
          */
-        ret &= rustsecp256k1_v0_10_0_eckey_pubkey_tweak_add(&P_output_ge, &t_k_scalar);
+        if (!rustsecp256k1_v0_10_0_silentpayments_create_output_tweak(&output_tweak_scalar, shared_secret, k)) {
+            rustsecp256k1_v0_10_0_scalar_clear(&output_tweak_scalar);
+            rustsecp256k1_v0_10_0_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            return 0;
+        }
+
+        /* Calculate output = spend_pubkey + output_tweak * G.
+         * This can fail if output_tweak * G is the negation of spend_pubkey, but this happens only
+         * with negligible probability for honestly created spend_pubkey as output_tweak is the output of a hash function. */
+        if (!rustsecp256k1_v0_10_0_eckey_pubkey_tweak_add(&output_ge, &output_tweak_scalar)) {
+            /* Leaking these values would break indistinguishability of the transaction, so clear them. */
+            rustsecp256k1_v0_10_0_scalar_clear(&output_tweak_scalar);
+            rustsecp256k1_v0_10_0_memclear_explicit(&shared_secret, sizeof(shared_secret));
+            return 0;
+        }
         found = 0;
-        rustsecp256k1_v0_10_0_xonly_pubkey_save(&P_output_xonly, &P_output_ge);
-        for (i = 0; i < n_tx_outputs; i++) {
-            if (rustsecp256k1_v0_10_0_xonly_pubkey_cmp(ctx, &P_output_xonly, tx_outputs[i]) == 0) {
+        rustsecp256k1_v0_10_0_xonly_pubkey_save(&output_xonly, &output_ge);
+        for (j = 0; j < n_tx_outputs; j++) {
+            if (rustsecp256k1_v0_10_0_xonly_pubkey_cmp(ctx, &output_xonly, tx_outputs[j]) == 0) {
                 label_tweak = NULL;
                 found = 1;
-                found_idx = i;
+                found_idx = j;
                 break;
             }
 
-            /* If not found, proceed to check for labels (if the labels cache is present) */
+            /* If not found, proceed to check for labels (if a label lookup function is provided). */
             if (label_lookup != NULL) {
-                rustsecp256k1_v0_10_0_ge P_output_negated_ge, tx_output_ge;
+                rustsecp256k1_v0_10_0_ge output_negated_ge, tx_output_ge;
                 rustsecp256k1_v0_10_0_gej tx_output_gej, label_gej;
                 unsigned char label33[33];
                 size_t len;
 
-                rustsecp256k1_v0_10_0_xonly_pubkey_load(ctx, &tx_output_ge, tx_outputs[i]);
+                rustsecp256k1_v0_10_0_xonly_pubkey_load(ctx, &tx_output_ge, tx_outputs[j]);
                 rustsecp256k1_v0_10_0_gej_set_ge(&tx_output_gej, &tx_output_ge);
-                rustsecp256k1_v0_10_0_ge_neg(&P_output_negated_ge, &P_output_ge);
-                /* Negate the generated output and calculate first scan label candidate:
-                 * label1 = tx_output - P_output */
-                rustsecp256k1_v0_10_0_gej_add_ge_var(&label_gej, &tx_output_gej, &P_output_negated_ge, NULL);
-                rustsecp256k1_v0_10_0_ge_set_gej(&label_ge, &label_gej);
-                rustsecp256k1_v0_10_0_eckey_pubkey_serialize(&label_ge, label33, &len, 1);
+                rustsecp256k1_v0_10_0_ge_neg(&output_negated_ge, &output_ge);
+                rustsecp256k1_v0_10_0_gej_add_ge_var(&label_gej, &tx_output_gej, &output_negated_ge, NULL);
+                rustsecp256k1_v0_10_0_ge_set_gej_var(&label_ge, &label_gej);
+                ret = rustsecp256k1_v0_10_0_eckey_pubkey_serialize(&label_ge, label33, &len, 1);
+                /* Serialize must succeed because the point was just loaded.
+                 *
+                 * Note: serialize will also fail if label_ge is the point at infinity, but we know
+                 * this cannot happen since we only hit this branch if tx_output != output_xonly.
+                 * Thus, we know that label_ge = tx_output_gej + output_negated_ge cannot be the
+                 * point at infinity.
+                 */
+                VERIFY_CHECK(ret && len == 33);
                 label_tweak = label_lookup(label33, label_context);
                 if (label_tweak != NULL) {
                     found = 1;
-                    found_idx = i;
+                    found_idx = j;
                     break;
                 }
 
                 rustsecp256k1_v0_10_0_gej_neg(&label_gej, &tx_output_gej);
                 /* If not found, negate the tx_output and calculate second scan label candidate:
-                 * label2 = -tx_output - P_output */
-                rustsecp256k1_v0_10_0_gej_add_ge_var(&label_gej, &label_gej, &P_output_negated_ge, NULL);
-                rustsecp256k1_v0_10_0_ge_set_gej(&label_ge, &label_gej);
-                rustsecp256k1_v0_10_0_eckey_pubkey_serialize(&label_ge, label33, &len, 1);
+                 *     label2 = -tx_output - generated_output
+                 */
+                rustsecp256k1_v0_10_0_gej_add_ge_var(&label_gej, &label_gej, &output_negated_ge, NULL);
+                rustsecp256k1_v0_10_0_ge_set_gej_var(&label_ge, &label_gej);
+                ret = rustsecp256k1_v0_10_0_eckey_pubkey_serialize(&label_ge, label33, &len, 1);
+                /* Serialize must succeed because the point was just loaded.
+                 *
+                 * Note: serialize will also fail if label_ge is the point at infinity, but we know
+                 * this cannot happen since we only hit this branch if tx_output != output_xonly.
+                 * Thus, we know that label_ge = tx_output_gej + output_negated_ge cannot be the
+                 * point at infinity.
+                 */
+                VERIFY_CHECK(ret && len == 33);
                 label_tweak = label_lookup(label33, label_context);
                 if (label_tweak != NULL) {
                     found = 1;
-                    found_idx = i;
+                    found_idx = j;
                     break;
                 }
             }
         }
         if (found) {
             found_outputs[n_found]->output = *tx_outputs[found_idx];
-            rustsecp256k1_v0_10_0_scalar_get_b32(found_outputs[n_found]->tweak, &t_k_scalar);
+            rustsecp256k1_v0_10_0_scalar_get_b32(found_outputs[n_found]->tweak, &output_tweak_scalar);
+            /* Clear the output_tweak_scalar since we no longer need it and leaking this value would
+             * break indistinguishability of the transaction. */
+            rustsecp256k1_v0_10_0_scalar_clear(&output_tweak_scalar);
             if (label_tweak != NULL) {
                 found_outputs[n_found]->found_with_label = 1;
                 /* This is extremely unlikely to fail in that it can only really fail if label_tweak
                  * is the negation of the shared secret tweak. But since both tweak and label_tweak are
                  * created by hashing data, practically speaking this would only happen if an attacker
                  * tricked us into using a particular label_tweak (deviating from the protocol).
+                 *
+                 * Furthermore, although technically a failure for ec_seckey_tweak_add, this is not treated
+                 * as a failure for silent payments because the output is still spendable with just the
+                 * spend secret key. We set `tweak = 0` for this case.
                  */
-                ret &= rustsecp256k1_v0_10_0_ec_seckey_tweak_add(ctx, found_outputs[n_found]->tweak, label_tweak);
+                if (!rustsecp256k1_v0_10_0_ec_seckey_tweak_add(ctx, found_outputs[n_found]->tweak, label_tweak)) {
+                    memset(found_outputs[n_found]->tweak, 0, 32);
+                }
                 rustsecp256k1_v0_10_0_pubkey_save(&found_outputs[n_found]->label, &label_ge);
             } else {
                 found_outputs[n_found]->found_with_label = 0;
-                /* Set the label public key with an invalid public key value */
+                /* Set the label public key with an invalid public key value. */
                 memset(&found_outputs[n_found]->label, 0, sizeof(rustsecp256k1_v0_10_0_pubkey));
             }
-            /* Set everything for the next round of scanning */
+            /* Reset everything for the next round of scanning. */
             label_tweak = NULL;
             n_found++;
-            k++;
+            /* BIP0352 specifies that k is serialized as a 4 byte (32 bit) value, so we check to make
+             * sure we are not exceeding the max value for a uint32 before incrementing k.
+             * In practice, this should never happen as it would be impossible to create a transaction
+             * with this many outputs.
+             */
+            if (k < UINT32_MAX) {
+                k++;
+            } else {
+                return 0;
+            }
         } else {
+            rustsecp256k1_v0_10_0_scalar_clear(&output_tweak_scalar);
             break;
         }
     }
     *n_found_outputs = n_found;
-    /* Explicitly clear secrets. Recall that the scan key is not quite "secret" in that leaking the scan key
-     * results in a loss of privacy, not a loss of funds
-     */
-    rustsecp256k1_v0_10_0_scalar_clear(&rsk_scalar);
-    /* Explicitly clear the shared secret. While this isn't technically "secret data," any third party
-     * with access to the shared secret could potentially identify and link the transaction back to the
-     * recipient address
-     */
-    rustsecp256k1_v0_10_0_scalar_clear(&t_k_scalar);
-    memset(shared_secret, 0, sizeof(shared_secret));
-    return ret;
+
+    /* Leaking the shared_secret would break indistinguishability of the transaction, so clear it. */
+    rustsecp256k1_v0_10_0_memclear_explicit(shared_secret, sizeof(shared_secret));
+    return 1;
 }
 
-int rustsecp256k1_v0_10_0_silentpayments_recipient_create_shared_secret(const rustsecp256k1_v0_10_0_context *ctx, unsigned char *shared_secret33, const unsigned char *recipient_scan_key, const rustsecp256k1_v0_10_0_silentpayments_public_data *public_data) {
-    rustsecp256k1_v0_10_0_pubkey A_tweaked;
-    rustsecp256k1_v0_10_0_scalar rsk;
-    int ret = 1;
-    /* Sanity check inputs */
-    ARG_CHECK(shared_secret33 != NULL);
-    ARG_CHECK(recipient_scan_key != NULL);
-    ARG_CHECK(public_data != NULL);
-    ARG_CHECK(public_data->data[0] == 1);
-    /* TODO: do we need a _cmov operation here to avoid leaking information about the scan key?
-     * Recall: a scan key is not really "secret" data, its functionally the same as an xpub
-     */
-    ret &= rustsecp256k1_v0_10_0_scalar_set_b32_seckey(&rsk, recipient_scan_key);
-    ret &= rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_load_pubkey(ctx, &A_tweaked, public_data);
-    /* If there are any issues with the recipient scan key or public data, return early */
-    if (!ret) {
+int rustsecp256k1_v0_10_0_silentpayments_recipient_create_output_pubkeys(const rustsecp256k1_v0_10_0_context *ctx, rustsecp256k1_v0_10_0_xonly_pubkey **outputs_xonly, const unsigned char *scan_key32, const rustsecp256k1_v0_10_0_silentpayments_prevouts_summary *prevouts_summary, const rustsecp256k1_v0_10_0_pubkey **spend_pubkeys, size_t n_spend_pubkeys)
+{
+    rustsecp256k1_v0_10_0_scalar scan_key_scalar;
+    rustsecp256k1_v0_10_0_ge input_pubkey_ge;
+    int combined, valid_scan_key;
+    unsigned char shared_secret[33];
+
+    VERIFY_CHECK(ctx != NULL);
+    ARG_CHECK(outputs_xonly != NULL);
+    ARG_CHECK(scan_key32 != NULL);
+    ARG_CHECK(prevouts_summary != NULL);
+    ARG_CHECK(spend_pubkeys != NULL);
+    ARG_CHECK(n_spend_pubkeys > 0);
+    ARG_CHECK(rustsecp256k1_v0_10_0_memcmp_var(&prevouts_summary->data[0], rustsecp256k1_v0_10_0_silentpayments_prevouts_summary_magic, 4) == 0);
+    /* If there are any issues with the recipient scan key, return early. */
+    valid_scan_key = rustsecp256k1_v0_10_0_scalar_set_b32_seckey(&scan_key_scalar, scan_key32);
+    rustsecp256k1_v0_10_0_declassify(ctx, &valid_scan_key, sizeof(valid_scan_key));
+    if (!valid_scan_key) {
+        rustsecp256k1_v0_10_0_scalar_clear(&scan_key_scalar);
         return 0;
     }
-    rustsecp256k1_v0_10_0_silentpayments_create_shared_secret(ctx, shared_secret33, &rsk, &A_tweaked);
-
-    /* Explicitly clear secrets */
-    rustsecp256k1_v0_10_0_scalar_clear(&rsk);
-    return ret;
+    rustsecp256k1_v0_10_0_ge_from_bytes(&input_pubkey_ge, &prevouts_summary->data[5]);
+    combined = (int)prevouts_summary->data[4];
+    if (!combined) {
+        rustsecp256k1_v0_10_0_scalar input_hash_scalar;
+        rustsecp256k1_v0_10_0_scalar_set_b32(&input_hash_scalar, &prevouts_summary->data[5 + 64], NULL);
+        rustsecp256k1_v0_10_0_scalar_mul(&scan_key_scalar, &scan_key_scalar, &input_hash_scalar);
+    }
+    rustsecp256k1_v0_10_0_silentpayments_create_shared_secret(ctx, shared_secret, &input_pubkey_ge, &scan_key_scalar);
+    rustsecp256k1_v0_10_0_scalar_clear(&scan_key_scalar);
+    return rustsecp256k1_v0_10_0_silentpayments_create_output_pubkeys(ctx, outputs_xonly, shared_secret, spend_pubkeys, n_spend_pubkeys, 0);
 }
-
-int rustsecp256k1_v0_10_0_silentpayments_recipient_create_output_pubkey(const rustsecp256k1_v0_10_0_context *ctx, rustsecp256k1_v0_10_0_xonly_pubkey *P_output_xonly, const unsigned char *shared_secret33, const rustsecp256k1_v0_10_0_pubkey *recipient_spend_pubkey, unsigned int k)
-{
-    VERIFY_CHECK(ctx != NULL);
-    ARG_CHECK(P_output_xonly != NULL);
-    ARG_CHECK(shared_secret33 != NULL);
-    ARG_CHECK(recipient_spend_pubkey != NULL);
-    return rustsecp256k1_v0_10_0_silentpayments_create_output_pubkey(ctx, P_output_xonly, shared_secret33, recipient_spend_pubkey, k);
-}
-
 
 #endif

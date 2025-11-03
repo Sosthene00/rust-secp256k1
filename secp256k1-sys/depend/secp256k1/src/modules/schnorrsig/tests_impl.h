@@ -21,11 +21,12 @@ static void nonce_function_bip340_bitflip(unsigned char **args, size_t n_flip, s
 }
 
 static void run_nonce_function_bip340_tests(void) {
-    unsigned char tag[13] = "BIP0340/nonce";
-    unsigned char aux_tag[11] = "BIP0340/aux";
-    unsigned char algo[13] = "BIP0340/nonce";
+    /* "BIP0340/nonce" */
+    static const unsigned char tag[] = {'B', 'I', 'P', '0', '3', '4', '0', '/', 'n', 'o', 'n', 'c', 'e'};
+    /* "BIP0340/aux" */
+    static const unsigned char aux_tag[] = {'B', 'I', 'P', '0', '3', '4', '0', '/', 'a', 'u', 'x'};
+    unsigned char algo[] = {'B', 'I', 'P', '0', '3', '4', '0', '/', 'n', 'o', 'n', 'c', 'e'};
     size_t algolen = sizeof(algo);
-    rustsecp256k1_v0_10_0_sha256 sha;
     rustsecp256k1_v0_10_0_sha256 sha_optimized;
     unsigned char nonce[32], nonce_z[32];
     unsigned char msg[32];
@@ -39,16 +40,15 @@ static void run_nonce_function_bip340_tests(void) {
     /* Check that hash initialized by
      * rustsecp256k1_v0_10_0_nonce_function_bip340_sha256_tagged has the expected
      * state. */
-    rustsecp256k1_v0_10_0_sha256_initialize_tagged(&sha, tag, sizeof(tag));
     rustsecp256k1_v0_10_0_nonce_function_bip340_sha256_tagged(&sha_optimized);
-    test_sha256_eq(&sha, &sha_optimized);
+    test_sha256_tag_midstate(&sha_optimized, tag, sizeof(tag));
+
 
    /* Check that hash initialized by
     * rustsecp256k1_v0_10_0_nonce_function_bip340_sha256_tagged_aux has the expected
     * state. */
-    rustsecp256k1_v0_10_0_sha256_initialize_tagged(&sha, aux_tag, sizeof(aux_tag));
     rustsecp256k1_v0_10_0_nonce_function_bip340_sha256_tagged_aux(&sha_optimized);
-    test_sha256_eq(&sha, &sha_optimized);
+    test_sha256_tag_midstate(&sha_optimized, aux_tag, sizeof(aux_tag));
 
     testrand256(msg);
     testrand256(key);
@@ -158,7 +158,7 @@ static void test_schnorrsig_api(void) {
 /* Checks that hash initialized by rustsecp256k1_v0_10_0_schnorrsig_sha256_tagged has the
  * expected state. */
 static void test_schnorrsig_sha256_tagged(void) {
-    unsigned char tag[17] = "BIP0340/challenge";
+    unsigned char tag[] = {'B', 'I', 'P', '0', '3', '4', '0', '/', 'c', 'h', 'a', 'l', 'l', 'e', 'n', 'g', 'e'};
     rustsecp256k1_v0_10_0_sha256 sha;
     rustsecp256k1_v0_10_0_sha256 sha_optimized;
 
@@ -806,7 +806,7 @@ static void test_schnorrsig_sign(void) {
     unsigned char sk[32];
     rustsecp256k1_v0_10_0_xonly_pubkey pk;
     rustsecp256k1_v0_10_0_keypair keypair;
-    const unsigned char msg[32] = "this is a msg for a schnorrsig..";
+    const unsigned char msg[] = {'t', 'h', 'i', 's', ' ', 'i', 's', ' ', 'a', ' ', 'm', 's', 'g', ' ', 'f', 'o', 'r', ' ', 'a', ' ', 's', 'c', 'h', 'n', 'o', 'r', 'r', 's', 'i', 'g', '.', '.'};
     unsigned char sig[64];
     unsigned char sig2[64];
     unsigned char zeros64[64] = { 0 };

@@ -5,6 +5,8 @@
  ***********************************************************************/
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "../include/secp256k1.h"
 #include "assumptions.h"
@@ -30,8 +32,16 @@
 #include "../include/secp256k1_schnorrsig.h"
 #endif
 
+#ifdef ENABLE_MODULE_MUSIG
+#include "../include/secp256k1_musig.h"
+#endif
+
 #ifdef ENABLE_MODULE_ELLSWIFT
 #include "../include/secp256k1_ellswift.h"
+#endif
+
+#ifdef ENABLE_MODULE_SILENTPAYMENTS
+#include "../include/secp256k1_silentpayments.h"
 #endif
 
 static void run_tests(rustsecp256k1_v0_10_0_context *ctx, unsigned char *key);
@@ -44,7 +54,7 @@ int main(void) {
     if (!SECP256K1_CHECKMEM_RUNNING()) {
         fprintf(stderr, "This test can only usefully be run inside valgrind because it was not compiled under msan.\n");
         fprintf(stderr, "Usage: libtool --mode=execute valgrind ./ctime_tests\n");
-        return 1;
+        return EXIT_FAILURE;
     }
     ctx = rustsecp256k1_v0_10_0_context_create(SECP256K1_CONTEXT_DECLASSIFY);
     /** In theory, testing with a single secret input should be sufficient:
@@ -64,7 +74,7 @@ int main(void) {
     CHECK(ret);
 
     rustsecp256k1_v0_10_0_context_destroy(ctx);
-    return 0;
+    return EXIT_SUCCESS;
 }
 
 static void run_tests(rustsecp256k1_v0_10_0_context *ctx, unsigned char *key) {
@@ -87,6 +97,25 @@ static void run_tests(rustsecp256k1_v0_10_0_context *ctx, unsigned char *key) {
 #ifdef ENABLE_MODULE_ELLSWIFT
     unsigned char ellswift[64];
     static const unsigned char prefix[64] = {'t', 'e', 's', 't'};
+#endif
+#ifdef ENABLE_MODULE_SILENTPAYMENTS
+    rustsecp256k1_v0_10_0_xonly_pubkey generated_output;
+    rustsecp256k1_v0_10_0_xonly_pubkey *generated_outputs[1];
+    rustsecp256k1_v0_10_0_silentpayments_recipient recipient;
+    const rustsecp256k1_v0_10_0_silentpayments_recipient *recipients[1];
+    unsigned char outpoint_smallest[36] = { 0 };
+    rustsecp256k1_v0_10_0_keypair taproot_seckey;
+    const rustsecp256k1_v0_10_0_keypair *taproot_seckeys[1];
+    const unsigned char *plain_seckeys[1];
+    rustsecp256k1_v0_10_0_silentpayments_found_output *found_outputs[1];
+    size_t n_found_outputs;
+    const rustsecp256k1_v0_10_0_xonly_pubkey *tx_outputs[1];
+    rustsecp256k1_v0_10_0_silentpayments_prevouts_summary prevouts_summary;
+    unsigned char label_tweak[32] = { 0 };
+    rustsecp256k1_v0_10_0_xonly_pubkey xonly_pubkey;
+    const rustsecp256k1_v0_10_0_xonly_pubkey *xonly_pubkeys[1];
+    rustsecp256k1_v0_10_0_pubkey plain_pubkey;
+    const rustsecp256k1_v0_10_0_pubkey *plain_pubkeys[1];
 #endif
 
     for (i = 0; i < 32; i++) {
@@ -180,6 +209,58 @@ static void run_tests(rustsecp256k1_v0_10_0_context *ctx, unsigned char *key) {
     CHECK(ret == 1);
 #endif
 
+#ifdef ENABLE_MODULE_MUSIG
+    {
+        rustsecp256k1_v0_10_0_pubkey pk;
+        const rustsecp256k1_v0_10_0_pubkey *pk_ptr[1];
+        rustsecp256k1_v0_10_0_xonly_pubkey agg_pk;
+        unsigned char session_secrand[32];
+        uint64_t nonrepeating_cnt = 0;
+        rustsecp256k1_v0_10_0_musig_secnonce secnonce;
+        rustsecp256k1_v0_10_0_musig_pubnonce pubnonce;
+        const rustsecp256k1_v0_10_0_musig_pubnonce *pubnonce_ptr[1];
+        rustsecp256k1_v0_10_0_musig_aggnonce aggnonce;
+        rustsecp256k1_v0_10_0_musig_keyagg_cache cache;
+        rustsecp256k1_v0_10_0_musig_session session;
+        rustsecp256k1_v0_10_0_musig_partial_sig partial_sig;
+        unsigned char extra_input[32];
+
+        pk_ptr[0] = &pk;
+        pubnonce_ptr[0] = &pubnonce;
+        SECP256K1_CHECKMEM_DEFINE(key, 32);
+        memcpy(session_secrand, key, sizeof(session_secrand));
+        session_secrand[0] = session_secrand[0] + 1;
+        memcpy(extra_input, key, sizeof(extra_input));
+        extra_input[0] = extra_input[0] + 2;
+
+        CHECK(rustsecp256k1_v0_10_0_keypair_create(ctx, &keypair, key));
+        CHECK(rustsecp256k1_v0_10_0_keypair_pub(ctx, &pk, &keypair));
+        CHECK(rustsecp256k1_v0_10_0_musig_pubkey_agg(ctx, &agg_pk, &cache, pk_ptr, 1));
+
+        SECP256K1_CHECKMEM_UNDEFINE(key, 32);
+        SECP256K1_CHECKMEM_UNDEFINE(session_secrand, sizeof(session_secrand));
+        SECP256K1_CHECKMEM_UNDEFINE(extra_input, sizeof(extra_input));
+        ret = rustsecp256k1_v0_10_0_musig_nonce_gen(ctx, &secnonce, &pubnonce, session_secrand, key, &pk, msg, &cache, extra_input);
+        SECP256K1_CHECKMEM_DEFINE(&ret, sizeof(ret));
+        CHECK(ret == 1);
+        ret = rustsecp256k1_v0_10_0_musig_nonce_gen_counter(ctx, &secnonce, &pubnonce, nonrepeating_cnt, &keypair, msg, &cache, extra_input);
+        SECP256K1_CHECKMEM_DEFINE(&ret, sizeof(ret));
+        CHECK(ret == 1);
+
+        CHECK(rustsecp256k1_v0_10_0_musig_nonce_agg(ctx, &aggnonce, pubnonce_ptr, 1));
+        /* Make sure that previous tests don't undefine msg. It's not used as a secret here. */
+        SECP256K1_CHECKMEM_DEFINE(msg, sizeof(msg));
+        CHECK(rustsecp256k1_v0_10_0_musig_nonce_process(ctx, &session, &aggnonce, msg, &cache) == 1);
+
+        ret = rustsecp256k1_v0_10_0_keypair_create(ctx, &keypair, key);
+        SECP256K1_CHECKMEM_DEFINE(&ret, sizeof(ret));
+        CHECK(ret == 1);
+        ret = rustsecp256k1_v0_10_0_musig_partial_sign(ctx, &partial_sig, &secnonce, &keypair, &cache, &session);
+        SECP256K1_CHECKMEM_DEFINE(&ret, sizeof(ret));
+        CHECK(ret == 1);
+    }
+#endif
+
 #ifdef ENABLE_MODULE_ELLSWIFT
     SECP256K1_CHECKMEM_UNDEFINE(key, 32);
     ret = rustsecp256k1_v0_10_0_ellswift_create(ctx, ellswift, key, NULL);
@@ -204,6 +285,58 @@ static void run_tests(rustsecp256k1_v0_10_0_context *ctx, unsigned char *key) {
         SECP256K1_CHECKMEM_DEFINE(&ret, sizeof(ret));
         CHECK(ret == 1);
     }
+
+#endif
+
+#ifdef ENABLE_MODULE_SILENTPAYMENTS
+    SECP256K1_CHECKMEM_DEFINE(key, 32);
+
+    generated_outputs[0] = &generated_output;
+
+    /* Initialize recipient */
+    CHECK(rustsecp256k1_v0_10_0_ec_pubkey_create(ctx, &recipient.scan_pubkey, key));
+    key[31] ^= 1;
+    CHECK(rustsecp256k1_v0_10_0_ec_pubkey_create(ctx, &recipient.spend_pubkey, key));
+    key[31] ^= (1 << 1);
+    recipient.index = 0;
+    recipients[0] = &recipient;
+
+    /* Set up secret keys */
+    SECP256K1_CHECKMEM_UNDEFINE(key, 32);
+    ret = rustsecp256k1_v0_10_0_keypair_create(ctx, &taproot_seckey, key);
+    SECP256K1_CHECKMEM_DEFINE(&ret, sizeof(ret));
+    CHECK(ret);
+    key[31] ^= (1 << 2);
+    taproot_seckeys[0] = &taproot_seckey;
+    plain_seckeys[0] = key;
+
+    ret = rustsecp256k1_v0_10_0_silentpayments_sender_create_outputs(ctx, generated_outputs, recipients, 1, outpoint_smallest, taproot_seckeys, 1, plain_seckeys, 1);
+    CHECK(ret == 1);
+
+    ret = rustsecp256k1_v0_10_0_silentpayments_recipient_create_label(ctx, &recipient.spend_pubkey, label_tweak, key, 0);
+    key[31] ^= (1 << 3);
+    SECP256K1_CHECKMEM_DEFINE(&ret, sizeof(ret));
+    CHECK(ret == 1);
+
+    CHECK(rustsecp256k1_v0_10_0_keypair_xonly_pub(ctx, &xonly_pubkey, NULL, &taproot_seckey));
+    SECP256K1_CHECKMEM_DEFINE(&xonly_pubkey, sizeof(xonly_pubkey));
+    xonly_pubkeys[0] = &xonly_pubkey;
+    ret = rustsecp256k1_v0_10_0_ec_pubkey_create(ctx, &plain_pubkey, plain_seckeys[0]);
+    SECP256K1_CHECKMEM_DEFINE(&ret, sizeof(ret));
+    CHECK(ret == 1);
+    SECP256K1_CHECKMEM_DEFINE(&plain_pubkey, sizeof(plain_pubkey));
+    plain_pubkeys[0] = &plain_pubkey;
+
+    ret = rustsecp256k1_v0_10_0_silentpayments_recipient_prevouts_summary_create(ctx, &prevouts_summary, outpoint_smallest, xonly_pubkeys, 1, plain_pubkeys, 1);
+    CHECK(ret == 1);
+
+    tx_outputs[0] = generated_outputs[0];
+    n_found_outputs = 1;
+    SECP256K1_CHECKMEM_DEFINE(&recipient.spend_pubkey, sizeof(recipient.spend_pubkey));
+    /* It is sufficient to check _recipient_scan_outputs without a label lookup function, since the shared secret is created once (which is where the constant timeness matters)
+     * and then reused for the rest of the scanning logic.
+     */
+    CHECK(rustsecp256k1_v0_10_0_silentpayments_recipient_scan_outputs(ctx, found_outputs, &n_found_outputs, tx_outputs, 1, key, &prevouts_summary, &recipient.spend_pubkey, NULL, NULL));
 
 #endif
 }

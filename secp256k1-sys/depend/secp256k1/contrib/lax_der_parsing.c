@@ -7,9 +7,11 @@
 #include <string.h>
 
 #include "lax_der_parsing.h"
+
 extern int rustsecp256k1_v0_10_0_ecdsa_signature_parse_compact(
-        const rustsecp256k1_v0_10_0_context *ctx,
-        rustsecp256k1_v0_10_0_ecdsa_signature *sig, const unsigned char *input64);
+    const rustsecp256k1_v0_10_0_context *ctx,
+    rustsecp256k1_v0_10_0_ecdsa_signature *sig, const unsigned char *input64);
+
 int rustsecp256k1_v0_10_0_ecdsa_signature_parse_der_lax(const rustsecp256k1_v0_10_0_context* ctx, rustsecp256k1_v0_10_0_ecdsa_signature* sig, const unsigned char *input, size_t inputlen) {
     size_t rpos, rlen, spos, slen;
     size_t pos = 0;

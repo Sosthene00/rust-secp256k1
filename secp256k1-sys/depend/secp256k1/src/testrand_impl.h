@@ -18,7 +18,7 @@
 static uint64_t rustsecp256k1_v0_10_0_test_state[4];
 
 SECP256K1_INLINE static void testrand_seed(const unsigned char *seed16) {
-    static const unsigned char PREFIX[19] = "secp256k1 test init";
+    static const unsigned char PREFIX[] = {'s', 'e', 'c', 'p', '2', '5', '6', 'k', '1', ' ', 't', 'e', 's', 't', ' ', 'i', 'n', 'i', 't'};
     unsigned char out32[32];
     rustsecp256k1_v0_10_0_sha256 hash;
     int i;

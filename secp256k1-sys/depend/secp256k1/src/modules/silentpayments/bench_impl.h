@@ -11,12 +11,14 @@
 
 typedef struct {
     rustsecp256k1_v0_10_0_context *ctx;
-    rustsecp256k1_v0_10_0_pubkey spend_pubkey;
+    rustsecp256k1_v0_10_0_pubkey spend_pubkeys[1];
     unsigned char scan_key[32];
-    rustsecp256k1_v0_10_0_silentpayments_public_data public_data;
-    rustsecp256k1_v0_10_0_xonly_pubkey tx_outputs[4];
-    rustsecp256k1_v0_10_0_silentpayments_found_output found_outputs[4];
+    unsigned char input_pubkey33[33];
+    rustsecp256k1_v0_10_0_xonly_pubkey tx_outputs[2];
+    rustsecp256k1_v0_10_0_xonly_pubkey tx_inputs[2];
+    rustsecp256k1_v0_10_0_silentpayments_found_output found_outputs[2];
     unsigned char scalar[32];
+    unsigned char smallest_outpoint[36];
 } bench_silentpayments_data;
 
 /* we need a non-null pointer for the cache */
@@ -31,11 +33,21 @@ const unsigned char* label_lookup(const unsigned char* key, const void* cache_pt
 static void bench_silentpayments_scan_setup(void* arg) {
     int i;
     bench_silentpayments_data *data = (bench_silentpayments_data*)arg;
-    const unsigned char tx_outputs[4][32] = {
+    const unsigned char tx_outputs[2][32] = {
         {0x84,0x17,0x92,0xc3,0x3c,0x9d,0xc6,0x19,0x3e,0x76,0x74,0x41,0x34,0x12,0x5d,0x40,0xad,0xd8,0xf2,0xf4,0xa9,0x64,0x75,0xf2,0x8b,0xa1,0x50,0xbe,0x03,0x2d,0x64,0xe8},
         {0x2e,0x84,0x7b,0xb0,0x1d,0x1b,0x49,0x1d,0xa5,0x12,0xdd,0xd7,0x60,0xb8,0x50,0x96,0x17,0xee,0x38,0x05,0x70,0x03,0xd6,0x11,0x5d,0x00,0xba,0x56,0x24,0x51,0x32,0x3a},
-        {0xf2,0x07,0x16,0x2b,0x1a,0x7a,0xbc,0x51,0xc4,0x20,0x17,0xbe,0xf0,0x55,0xe9,0xec,0x1e,0xfc,0x3d,0x35,0x67,0xcb,0x72,0x03,0x57,0xe2,0xb8,0x43,0x25,0xdb,0x33,0xac},
-        {0xe9,0x76,0xa5,0x8f,0xbd,0x38,0xae,0xb4,0xe6,0x09,0x3d,0x4d,0xf0,0x2e,0x9c,0x1d,0xe0,0xc4,0x51,0x3a,0xe0,0xc5,0x88,0xce,0xf6,0x8c,0xda,0x5b,0x2f,0x88,0x34,0xca}
+    };
+    const unsigned char static_tx_input[32] = {
+        0xf2,0x07,0x16,0x2b,0x1a,0x7a,0xbc,0x51,
+        0xc4,0x20,0x17,0xbe,0xf0,0x55,0xe9,0xec,
+        0x1e,0xfc,0x3d,0x35,0x67,0xcb,0x72,0x03,
+        0x57,0xe2,0xb8,0x43,0x25,0xdb,0x33,0xac
+    };
+    const unsigned char smallest_outpoint[36] = {
+        0x16, 0x9e, 0x1e, 0x83, 0xe9, 0x30, 0x85, 0x33, 0x91,
+        0xbc, 0x6f, 0x35, 0xf6, 0x05, 0xc6, 0x75, 0x4c, 0xfe,
+        0xad, 0x57, 0xcf, 0x83, 0x87, 0x63, 0x9d, 0x3b, 0x40,
+        0x96, 0xc5, 0x4f, 0x18, 0xf4, 0x00, 0x00, 0x00, 0x00,
     };
     const unsigned char spend_pubkey[33] = {
         0x02,0xee,0x97,0xdf,0x83,0xb2,0x54,0x6a,
@@ -51,76 +63,102 @@ static void bench_silentpayments_scan_setup(void* arg) {
     };
     rustsecp256k1_v0_10_0_keypair input_keypair;
     rustsecp256k1_v0_10_0_pubkey input_pubkey;
-    unsigned char input_pubkey33[33];
     size_t pubkeylen = 33;
 
     for (i = 0; i < 32; i++) {
         data->scalar[i] = i + 1;
     }
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 2; i++) {
         CHECK(rustsecp256k1_v0_10_0_xonly_pubkey_parse(data->ctx, &data->tx_outputs[i], tx_outputs[i]));
     }
+    /* Create the first input public key from the scalar.
+     * This input is also used to create the serialized prevouts_summary object for the light client
+     */
     CHECK(rustsecp256k1_v0_10_0_keypair_create(data->ctx, &input_keypair, data->scalar));
     CHECK(rustsecp256k1_v0_10_0_keypair_pub(data->ctx, &input_pubkey, &input_keypair));
-    CHECK(rustsecp256k1_v0_10_0_ec_pubkey_serialize(data->ctx, input_pubkey33, &pubkeylen, &input_pubkey, SECP256K1_EC_COMPRESSED));
-    CHECK(rustsecp256k1_v0_10_0_silentpayments_recipient_public_data_parse(data->ctx, &data->public_data, input_pubkey33));
-    CHECK(rustsecp256k1_v0_10_0_ec_pubkey_parse(data->ctx, &data->spend_pubkey, spend_pubkey, pubkeylen));
+    CHECK(rustsecp256k1_v0_10_0_ec_pubkey_serialize(data->ctx, data->input_pubkey33, &pubkeylen, &input_pubkey, SECP256K1_EC_COMPRESSED));
+    /* Create the input public keys for the full scan */
+    CHECK(rustsecp256k1_v0_10_0_keypair_xonly_pub(data->ctx, &data->tx_inputs[0], NULL, &input_keypair));
+    CHECK(rustsecp256k1_v0_10_0_xonly_pubkey_parse(data->ctx, &data->tx_inputs[1], static_tx_input));
+    CHECK(rustsecp256k1_v0_10_0_ec_pubkey_parse(data->ctx, &data->spend_pubkeys[0], spend_pubkey, pubkeylen));
     memcpy(data->scan_key, scan_key, 32);
+    memcpy(data->smallest_outpoint, smallest_outpoint, 36);
 }
 
 static void bench_silentpayments_output_scan(void* arg, int iters) {
-    int i, k = 0;
+    int i = 0;
     bench_silentpayments_data *data = (bench_silentpayments_data*)arg;
+    rustsecp256k1_v0_10_0_silentpayments_prevouts_summary prevouts_summary;
+    const rustsecp256k1_v0_10_0_pubkey *spend_ptrs[1];
+    spend_ptrs[0] = &data->spend_pubkeys[0];
 
     for (i = 0; i < iters; i++) {
-        unsigned char shared_secret[33];
-        rustsecp256k1_v0_10_0_xonly_pubkey xonly_output;
-        CHECK(rustsecp256k1_v0_10_0_silentpayments_recipient_create_shared_secret(data->ctx,
-            shared_secret,
+        rustsecp256k1_v0_10_0_xonly_pubkey *xonly_output_ptrs[1];
+        rustsecp256k1_v0_10_0_xonly_pubkey xonly_outputs[1];
+        xonly_output_ptrs[0] = &xonly_outputs[0];
+        CHECK(rustsecp256k1_v0_10_0_silentpayments_recipient_prevouts_summary_parse(data->ctx, &prevouts_summary, data->input_pubkey33, 33));
+        CHECK(rustsecp256k1_v0_10_0_silentpayments_recipient_create_output_pubkeys(data->ctx,
+            xonly_output_ptrs,
             data->scan_key,
-            &data->public_data
-        ));
-        CHECK(rustsecp256k1_v0_10_0_silentpayments_recipient_create_output_pubkey(data->ctx,
-            &xonly_output,
-            shared_secret,
-            &data->spend_pubkey,
-            k
+            &prevouts_summary,
+            spend_ptrs,
+            1
         ));
     }
 }
 
-static void bench_silentpayments_full_tx_scan(void* arg, int iters) {
+static void bench_silentpayments_full_tx_scan(void* arg, int iters, int use_labels) {
     int i;
     size_t n_found = 0;
-    rustsecp256k1_v0_10_0_silentpayments_found_output *found_output_ptrs[4];
-    const rustsecp256k1_v0_10_0_xonly_pubkey *tx_output_ptrs[4];
+    rustsecp256k1_v0_10_0_silentpayments_found_output *found_output_ptrs[2];
+    const rustsecp256k1_v0_10_0_xonly_pubkey *tx_output_ptrs[2];
+    const rustsecp256k1_v0_10_0_xonly_pubkey *tx_input_ptrs[2];
     bench_silentpayments_data *data = (bench_silentpayments_data*)arg;
+    rustsecp256k1_v0_10_0_silentpayments_prevouts_summary prevouts_summary;
+    const rustsecp256k1_v0_10_0_silentpayments_label_lookup label_lookup_fn = use_labels ? label_lookup : NULL;
+    const void *label_context = use_labels ? label_cache : NULL;
 
-    for (i = 0; i < 4; i++) {
+    for (i = 0; i < 2; i++) {
         found_output_ptrs[i] = &data->found_outputs[i];
         tx_output_ptrs[i] = &data->tx_outputs[i];
+        tx_input_ptrs[i] = &data->tx_inputs[i];
     }
     for (i = 0; i < iters; i++) {
+        CHECK(rustsecp256k1_v0_10_0_silentpayments_recipient_prevouts_summary_create(data->ctx,
+            &prevouts_summary,
+            data->smallest_outpoint,
+            tx_input_ptrs, 2,
+            NULL, 0
+        ));
         CHECK(rustsecp256k1_v0_10_0_silentpayments_recipient_scan_outputs(data->ctx,
             found_output_ptrs, &n_found,
-            tx_output_ptrs, 4,
+            tx_output_ptrs, 2,
             data->scan_key,
-            &data->public_data,
-            &data->spend_pubkey,
-            label_lookup, label_cache)
+            &prevouts_summary,
+            &data->spend_pubkeys[0],
+            label_lookup_fn, label_context)
         );
+        CHECK(n_found == 0);
     }
+}
+
+static void bench_silentpayments_full_scan(void *arg, int iters) {
+    bench_silentpayments_full_tx_scan(arg, iters, 0);
+}
+
+static void bench_silentpayments_full_scan_with_labels(void *arg, int iters) {
+    bench_silentpayments_full_tx_scan(arg, iters, 1);
 }
 
 static void run_silentpayments_bench(int iters, int argc, char** argv) {
     bench_silentpayments_data data;
     int d = argc == 1;
 
-    /* create a context with no capabilities */
-    data.ctx = rustsecp256k1_v0_10_0_context_create(SECP256K1_FLAGS_TYPE_CONTEXT);
+    data.ctx = rustsecp256k1_v0_10_0_context_create(SECP256K1_CONTEXT_NONE);
 
-    if (d || have_flag(argc, argv, "silentpayments")) run_benchmark("silentpayments_full_tx_scan", bench_silentpayments_full_tx_scan, bench_silentpayments_scan_setup, NULL, &data, 10, iters);
-    if (d || have_flag(argc, argv, "silentpayments")) run_benchmark("silentpayments_output_scan", bench_silentpayments_output_scan, bench_silentpayments_scan_setup, NULL, &data, 10, iters);
+    if (d || have_flag(argc, argv, "silentpayments") || have_flag(argc, argv, "silentpayments_output_scan")) run_benchmark("silentpayments_output_scan", bench_silentpayments_output_scan, bench_silentpayments_scan_setup, NULL, &data, 10, iters);
+    if (d || have_flag(argc, argv, "silentpayments") || have_flag(argc, argv, "silentpayments_full_scan")) run_benchmark("silentpayments_full_scan", bench_silentpayments_full_scan, bench_silentpayments_scan_setup, NULL, &data, 10, iters);
+    if (d || have_flag(argc, argv, "silentpayments") || have_flag(argc, argv, "silentpayments_full_scan_with_labels")) run_benchmark("silentpayments_full_scan_with_labels", bench_silentpayments_full_scan_with_labels, bench_silentpayments_scan_setup, NULL, &data, 10, iters);
 
     rustsecp256k1_v0_10_0_context_destroy(data.ctx);
 }

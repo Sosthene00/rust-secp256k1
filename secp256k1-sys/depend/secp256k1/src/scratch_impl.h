@@ -10,6 +10,7 @@
 #include "util.h"
 #include "scratch.h"
 
+
 static size_t rustsecp256k1_v0_10_0_scratch_checkpoint(const rustsecp256k1_v0_10_0_callback* error_callback, const rustsecp256k1_v0_10_0_scratch* scratch) {
     if (rustsecp256k1_v0_10_0_memcmp_var(scratch->magic, "scratch", 8) != 0) {
         rustsecp256k1_v0_10_0_callback_call(error_callback, "invalid scratch space");

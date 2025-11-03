@@ -11,6 +11,14 @@
 #include "testrand.h"
 #include "util.h"
 
+/* group order of the secp256k1 curve in 32-byte big endian representation */
+static const unsigned char rustsecp256k1_v0_10_0_group_order_bytes[32] = {
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe,
+    0xba, 0xae, 0xdc, 0xe6, 0xaf, 0x48, 0xa0, 0x3b,
+    0xbf, 0xd2, 0x5e, 0x8c, 0xd0, 0x36, 0x41, 0x41
+};
+
 static void testutil_random_fe(rustsecp256k1_v0_10_0_fe *x) {
     unsigned char bin[32];
     do {
@@ -34,7 +42,7 @@ static void testutil_random_fe_magnitude(rustsecp256k1_v0_10_0_fe *fe, int m) {
     if (n == 0) {
         return;
     }
-    rustsecp256k1_v0_10_0_fe_clear(&zero);
+    rustsecp256k1_v0_10_0_fe_set_int(&zero, 0);
     rustsecp256k1_v0_10_0_fe_negate(&zero, &zero, 0);
     rustsecp256k1_v0_10_0_fe_mul_int_unchecked(&zero, n - 1);
     rustsecp256k1_v0_10_0_fe_add(fe, &zero);

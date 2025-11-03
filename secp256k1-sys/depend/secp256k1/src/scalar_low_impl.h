@@ -19,8 +19,6 @@ SECP256K1_INLINE static int rustsecp256k1_v0_10_0_scalar_is_even(const rustsecp2
     return !(*a & 1);
 }
 
-SECP256K1_INLINE static void rustsecp256k1_v0_10_0_scalar_clear(rustsecp256k1_v0_10_0_scalar *r) { *r = 0; }
-
 SECP256K1_INLINE static void rustsecp256k1_v0_10_0_scalar_set_int(rustsecp256k1_v0_10_0_scalar *r, unsigned int v) {
     *r = v % EXHAUSTIVE_TEST_ORDER;
 
